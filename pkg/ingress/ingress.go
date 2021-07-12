@@ -24,11 +24,9 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
-	"github.com/apache/apisix-ingress-controller/pkg/config"
 	"github.com/apache/apisix-ingress-controller/pkg/kube"
 	"github.com/apache/apisix-ingress-controller/pkg/log"
 	"github.com/apache/apisix-ingress-controller/pkg/types"
-	apisixv1 "github.com/apache/apisix-ingress-controller/pkg/types/apisix/v1"
 )
 
 const (
@@ -59,6 +57,7 @@ func (c *Controller) newIngressController() *ingressController {
 func (c *ingressController) run(ctx context.Context) {
 	log.Info("ingress controller started")
 	defer log.Infof("ingress controller exited")
+	defer c.workqueue.ShutDown()
 
 	if !cache.WaitForCacheSync(ctx.Done(), c.controller.ingressInformer.HasSynced) {
 		log.Errorf("cache sync failed")
@@ -68,7 +67,6 @@ func (c *ingressController) run(ctx context.Context) {
 		go c.runWorker(ctx)
 	}
 	<-ctx.Done()
-	c.workqueue.ShutDown()
 }
 
 func (c *ingressController) runWorker(ctx context.Context) {
@@ -127,8 +125,7 @@ func (c *ingressController) sync(ctx context.Context, ev *types.Event) error {
 		ing = ev.Tombstone.(kube.Ingress)
 	}
 
-	// Translator should generate ID, fullname and name.
-	routes, upstreams, err := c.controller.translator.TranslateIngress(ing)
+	tctx, err := c.controller.translator.TranslateIngress(ing)
 	if err != nil {
 		log.Errorw("failed to translate ingress",
 			zap.Error(err),
@@ -139,13 +136,13 @@ func (c *ingressController) sync(ctx context.Context, ev *types.Event) error {
 
 	log.Debugw("translated ingress resource to a couple of routes and upstreams",
 		zap.Any("ingress", ing),
-		zap.Any("routes", routes),
-		zap.Any("upstreams", upstreams),
+		zap.Any("routes", tctx.Routes),
+		zap.Any("upstreams", tctx.Upstreams),
 	)
 
 	m := &manifest{
-		routes:    routes,
-		upstreams: upstreams,
+		routes:    tctx.Routes,
+		upstreams: tctx.Upstreams,
 	}
 
 	var (
@@ -159,11 +156,7 @@ func (c *ingressController) sync(ctx context.Context, ev *types.Event) error {
 	} else if ev.Type == types.EventAdd {
 		added = m
 	} else {
-		var (
-			oldRoutes    []*apisixv1.Route
-			oldUpstreams []*apisixv1.Upstream
-		)
-		oldRoutes, oldUpstreams, err := c.controller.translator.TranslateIngress(ingEv.OldObject)
+		oldCtx, err := c.controller.translator.TranslateIngress(ingEv.OldObject)
 		if err != nil {
 			log.Errorw("failed to translate ingress",
 				zap.String("event", "update"),
@@ -173,12 +166,18 @@ func (c *ingressController) sync(ctx context.Context, ev *types.Event) error {
 			return err
 		}
 		om := &manifest{
-			routes:    oldRoutes,
-			upstreams: oldUpstreams,
+			routes:    oldCtx.Routes,
+			upstreams: oldCtx.Upstreams,
 		}
 		added, updated, deleted = m.diff(om)
 	}
-	return c.controller.syncManifests(ctx, added, updated, deleted)
+	if err := c.controller.syncManifests(ctx, added, updated, deleted); err != nil {
+		log.Errorw("failed to sync ingress artifacts",
+			zap.Error(err),
+		)
+		return err
+	}
+	return nil
 }
 
 func (c *ingressController) handleSyncErr(obj interface{}, err error) {
@@ -207,11 +206,11 @@ func (c *ingressController) onAdd(obj interface{}) {
 	valid := c.isIngressEffective(ing)
 	if valid {
 		log.Debugw("ingress add event arrived",
-			zap.Any("object", obj),
+			zap.Any("object", ing),
 		)
 	} else {
 		log.Debugw("ignore noneffective ingress add event",
-			zap.Any("object", obj),
+			zap.Any("object", ing),
 		)
 		return
 	}
@@ -318,10 +317,10 @@ func (c *ingressController) isIngressEffective(ing kube.Ingress) bool {
 
 	// kubernetes.io/ingress.class takes the precedence.
 	if ica != "" {
-		return ica == config.IngressClass
+		return ica == c.controller.cfg.Kubernetes.IngressClass
 	}
 	if ic != nil {
-		return *ic == config.IngressClass
+		return *ic == c.controller.cfg.Kubernetes.IngressClass
 	}
 	return false
 }

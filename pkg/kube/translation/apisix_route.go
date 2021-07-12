@@ -23,18 +23,16 @@ import (
 	"github.com/apache/apisix-ingress-controller/pkg/id"
 	configv1 "github.com/apache/apisix-ingress-controller/pkg/kube/apisix/apis/config/v1"
 	configv2alpha1 "github.com/apache/apisix-ingress-controller/pkg/kube/apisix/apis/config/v2alpha1"
+	configv2beta1 "github.com/apache/apisix-ingress-controller/pkg/kube/apisix/apis/config/v2beta1"
 	"github.com/apache/apisix-ingress-controller/pkg/log"
 	apisixv1 "github.com/apache/apisix-ingress-controller/pkg/types/apisix/v1"
 )
 
-func (t *translator) TranslateRouteV1(ar *configv1.ApisixRoute) ([]*apisixv1.Route, []*apisixv1.Upstream, error) {
-	var (
-		routes    []*apisixv1.Route
-		upstreams []*apisixv1.Upstream
-	)
-
-	plugins := t.TranslateAnnotations(ar.Annotations)
-	upstreamMap := make(map[string]*apisixv1.Upstream)
+func (t *translator) TranslateRouteV1(ar *configv1.ApisixRoute) (*TranslateContext, error) {
+	ctx := &TranslateContext{
+		upstreamMap: make(map[string]struct{}),
+	}
+	plugins := t.translateAnnotations(ar.Annotations)
 
 	for _, r := range ar.Spec.Rules {
 		for _, p := range r.Http.Paths {
@@ -57,7 +55,7 @@ func (t *translator) TranslateRouteV1(ar *configv1.ApisixRoute) ([]*apisixv1.Rou
 				}
 			}
 
-			upstreamName := apisixv1.ComposeUpstreamName(ar.Namespace, p.Backend.ServiceName, int32(p.Backend.ServicePort))
+			upstreamName := apisixv1.ComposeUpstreamName(ar.Namespace, p.Backend.ServiceName, "", int32(p.Backend.ServicePort))
 			route := apisixv1.NewDefaultRoute()
 			route.Name = r.Host + p.Path
 			route.ID = id.GenID(route.Name)
@@ -66,53 +64,111 @@ func (t *translator) TranslateRouteV1(ar *configv1.ApisixRoute) ([]*apisixv1.Rou
 			route.Plugins = pluginMap
 			route.UpstreamId = id.GenID(upstreamName)
 
-			if _, ok := upstreamMap[upstreamName]; !ok {
-				ups, err := t.TranslateUpstream(ar.Namespace, p.Backend.ServiceName, int32(p.Backend.ServicePort))
+			if !ctx.checkUpstreamExist(upstreamName) {
+				ups, err := t.TranslateUpstream(ar.Namespace, p.Backend.ServiceName, "", int32(p.Backend.ServicePort))
 				if err != nil {
-					return nil, nil, err
+					return nil, err
 				}
 				ups.ID = route.UpstreamId
 				ups.Name = upstreamName
-				upstreamMap[ups.Name] = ups
+				ctx.addUpstream(ups)
 			}
-			routes = append(routes, route)
+			ctx.addRoute(route)
 		}
 	}
-	for _, ups := range upstreamMap {
-		upstreams = append(upstreams, ups)
-	}
-	return routes, upstreams, nil
+	return ctx, nil
 }
 
-func (t *translator) TranslateRouteV2alpha1(ar *configv2alpha1.ApisixRoute) ([]*apisixv1.Route, []*apisixv1.Upstream, error) {
-	var (
-		routes    []*apisixv1.Route
-		upstreams []*apisixv1.Upstream
-	)
+// TranslateRouteV2alpha1NotStrictly translates route v2alpha1 with a loose way, only generate ID and Name for delete Event.
+func (t *translator) TranslateRouteV2alpha1NotStrictly(ar *configv2alpha1.ApisixRoute) (*TranslateContext, error) {
+	ctx := &TranslateContext{
+		upstreamMap: make(map[string]struct{}),
+	}
 
-	ruleNameMap := make(map[string]struct{})
-	upstreamMap := make(map[string]*apisixv1.Upstream)
+	if err := t.translateHTTPRouteNotStrictly(ctx, ar); err != nil {
+		return nil, err
+	}
+	if err := t.translateTCPRouteNotStrictly(ctx, ar); err != nil {
+		return nil, err
+	}
+	return ctx, nil
+}
 
+func (t *translator) TranslateRouteV2alpha1(ar *configv2alpha1.ApisixRoute) (*TranslateContext, error) {
+	ctx := &TranslateContext{
+		upstreamMap: make(map[string]struct{}),
+	}
+
+	if err := t.translateHTTPRoute(ctx, ar); err != nil {
+		return nil, err
+	}
+	if err := t.translateTCPRoute(ctx, ar); err != nil {
+		return nil, err
+	}
+	return ctx, nil
+}
+
+// translateHTTPRouteNotStrictly translates http route with a loose way, only generate ID and Name for delete Event.
+func (t *translator) translateHTTPRouteNotStrictly(ctx *TranslateContext, ar *configv2alpha1.ApisixRoute) error {
 	for _, part := range ar.Spec.HTTP {
-		if part.Name == "" {
-			return nil, nil, errors.New("empty route rule name")
+		backends := part.Backends
+		backend := part.Backend
+		if len(backends) > 0 {
+			// Use the first backend as the default backend in Route,
+			// others will be configured in traffic-split plugin.
+			backend = backends[0]
+		} // else use the deprecated Backend.
+		upstreamName := apisixv1.ComposeUpstreamName(ar.Namespace, backend.ServiceName, backend.Subset, backend.ServicePort.IntVal)
+		route := apisixv1.NewDefaultRoute()
+		route.Name = apisixv1.ComposeRouteName(ar.Namespace, ar.Name, part.Name)
+		route.ID = id.GenID(route.Name)
+		ctx.addRoute(route)
+		if !ctx.checkUpstreamExist(upstreamName) {
+			ups, err := t.translateUpstreamNotStrictly(ar.Namespace, backend.ServiceName, backend.Subset, backend.ServicePort.IntVal)
+			if err != nil {
+				return err
+			}
+			ctx.addUpstream(ups)
 		}
+	}
+	return nil
+}
+
+func (t *translator) TranslateRouteV2beta1(ar *configv2beta1.ApisixRoute) (*TranslateContext, error) {
+	ctx := &TranslateContext{
+		upstreamMap: make(map[string]struct{}),
+	}
+
+	if err := t.translateHTTPRouteV2beta1(ctx, ar); err != nil {
+		return nil, err
+	}
+	if err := t.translateStreamRoute(ctx, ar); err != nil {
+		return nil, err
+	}
+	return ctx, nil
+}
+
+func (t *translator) TranslateRouteV2beta1NotStrictly(ar *configv2beta1.ApisixRoute) (*TranslateContext, error) {
+	ctx := &TranslateContext{
+		upstreamMap: make(map[string]struct{}),
+	}
+
+	if err := t.translateHTTPRouteV2beta1NotStrictly(ctx, ar); err != nil {
+		return nil, err
+	}
+	if err := t.translateStreamRouteNotStrictly(ctx, ar); err != nil {
+		return nil, err
+	}
+	return ctx, nil
+}
+
+func (t *translator) translateHTTPRouteV2beta1(ctx *TranslateContext, ar *configv2beta1.ApisixRoute) error {
+	ruleNameMap := make(map[string]struct{})
+	for _, part := range ar.Spec.HTTP {
 		if _, ok := ruleNameMap[part.Name]; ok {
-			return nil, nil, errors.New("duplicated route rule name")
+			return errors.New("duplicated route rule name")
 		}
 		ruleNameMap[part.Name] = struct{}{}
-		if part.Match == nil {
-			return nil, nil, errors.New("empty route match section")
-		}
-		if len(part.Match.Paths) < 1 {
-			return nil, nil, errors.New("empty route paths match")
-		}
-		if part.Backend != nil && len(part.Backends) > 1 {
-			return nil, nil, errors.New("backend and backends are exclusive")
-		}
-		if part.Backend == nil && len(part.Backends) == 0 {
-			return nil, nil, errors.New("no specified backend")
-		}
 		backends := part.Backends
 		backend := part.Backend
 		if len(backends) > 0 {
@@ -122,18 +178,18 @@ func (t *translator) TranslateRouteV2alpha1(ar *configv2alpha1.ApisixRoute) ([]*
 			backends = backends[1:]
 		} // else use the deprecated Backend.
 
-		svcClusterIP, svcPort, err := t.getServiceClusterIPAndPort(backend, ar)
+		svcClusterIP, svcPort, err := t.getServiceClusterIPAndPort(&backend, ar.Namespace)
 		if err != nil {
 			log.Errorw("failed to get service port in backend",
 				zap.Any("backend", backend),
 				zap.Any("apisix_route", ar),
 				zap.Error(err),
 			)
-			return nil, nil, err
+			return err
 		}
 
 		pluginMap := make(apisixv1.Plugins)
-		// 2.add route plugins
+		// add route plugins
 		for _, plugin := range part.Plugins {
 			if !plugin.Enable {
 				continue
@@ -144,6 +200,19 @@ func (t *translator) TranslateRouteV2alpha1(ar *configv2alpha1.ApisixRoute) ([]*
 				pluginMap[plugin.Name] = make(map[string]interface{})
 			}
 		}
+
+		// add KeyAuth and basicAuth plugin
+		if part.Authentication.Enable {
+			switch part.Authentication.Type {
+			case "keyAuth":
+				pluginMap["key-auth"] = part.Authentication.KeyAuth
+			case "basicAuth":
+				pluginMap["basic-auth"] = make(map[string]interface{})
+			default:
+				pluginMap["basic-auth"] = make(map[string]interface{})
+			}
+		}
+
 		var exprs [][]apisixv1.StringOrSlice
 		if part.Match.NginxVars != nil {
 			exprs, err = t.translateRouteMatchExprs(part.Match.NginxVars)
@@ -152,7 +221,7 @@ func (t *translator) TranslateRouteV2alpha1(ar *configv2alpha1.ApisixRoute) ([]*
 					zap.Error(err),
 					zap.Any("ApisixRoute", ar),
 				)
-				return nil, nil, err
+				return err
 			}
 		}
 		if err := validateRemoteAddrs(part.Match.RemoteAddrs); err != nil {
@@ -161,10 +230,10 @@ func (t *translator) TranslateRouteV2alpha1(ar *configv2alpha1.ApisixRoute) ([]*
 				zap.Strings("remote_addrs", part.Match.RemoteAddrs),
 				zap.Any("ApisixRoute", ar),
 			)
-			return nil, nil, err
+			return err
 		}
 
-		upstreamName := apisixv1.ComposeUpstreamName(ar.Namespace, backend.ServiceName, svcPort)
+		upstreamName := apisixv1.ComposeUpstreamName(ar.Namespace, backend.ServiceName, backend.Subset, svcPort)
 		route := apisixv1.NewDefaultRoute()
 		route.Name = apisixv1.ComposeRouteName(ar.Namespace, ar.Name, part.Name)
 		route.ID = id.GenID(route.Name)
@@ -183,36 +252,142 @@ func (t *translator) TranslateRouteV2alpha1(ar *configv2alpha1.ApisixRoute) ([]*
 			if backend.Weight != nil {
 				weight = *backend.Weight
 			}
-			ups, plugin, err := t.translateTrafficSplitPlugin(ar, weight, backends)
+			backendPoints := make([]*configv2alpha1.ApisixRouteHTTPBackend, 0)
+			for _, b := range backends {
+				backendPoints = append(backendPoints, &b)
+			}
+			plugin, err := t.translateTrafficSplitPlugin(ctx, ar.Namespace, weight, backendPoints)
 			if err != nil {
 				log.Errorw("failed to translate traffic-split plugin",
 					zap.Error(err),
 					zap.Any("ApisixRoute", ar),
 				)
-				return nil, nil, err
-			}
-			for _, u := range ups {
-				if _, ok := upstreamMap[u.Name]; !ok {
-					upstreamMap[u.Name] = u
-				}
+				return err
 			}
 			route.Plugins["traffic-split"] = plugin
 		}
-
-		routes = append(routes, route)
-		if _, ok := upstreamMap[upstreamName]; !ok {
-			ups, err := t.translateUpstream(ar.Namespace, backend.ServiceName, backend.ResolveGranularity, svcClusterIP, svcPort)
+		ctx.addRoute(route)
+		if !ctx.checkUpstreamExist(upstreamName) {
+			ups, err := t.translateUpstream(ar.Namespace, backend.ServiceName, backend.Subset, backend.ResolveGranularity, svcClusterIP, svcPort)
 			if err != nil {
-				return nil, nil, err
+				return err
 			}
-			upstreamMap[ups.Name] = ups
+			ctx.addUpstream(ups)
 		}
 	}
+	return nil
+}
 
-	for _, ups := range upstreamMap {
-		upstreams = append(upstreams, ups)
+func (t *translator) translateHTTPRoute(ctx *TranslateContext, ar *configv2alpha1.ApisixRoute) error {
+	ruleNameMap := make(map[string]struct{})
+	for _, part := range ar.Spec.HTTP {
+		if _, ok := ruleNameMap[part.Name]; ok {
+			return errors.New("duplicated route rule name")
+		}
+		ruleNameMap[part.Name] = struct{}{}
+		backends := part.Backends
+		backend := part.Backend
+		if len(backends) > 0 {
+			// Use the first backend as the default backend in Route,
+			// others will be configured in traffic-split plugin.
+			backend = backends[0]
+			backends = backends[1:]
+		} // else use the deprecated Backend.
+
+		svcClusterIP, svcPort, err := t.getServiceClusterIPAndPort(backend, ar.Namespace)
+		if err != nil {
+			log.Errorw("failed to get service port in backend",
+				zap.Any("backend", backend),
+				zap.Any("apisix_route", ar),
+				zap.Error(err),
+			)
+			return err
+		}
+
+		pluginMap := make(apisixv1.Plugins)
+		// 2.add route plugins
+		for _, plugin := range part.Plugins {
+			if !plugin.Enable {
+				continue
+			}
+			if plugin.Config != nil {
+				pluginMap[plugin.Name] = plugin.Config
+			} else {
+				pluginMap[plugin.Name] = make(map[string]interface{})
+			}
+		}
+
+		// add KeyAuth and basicAuth plugin
+		if part.Authentication != nil && part.Authentication.Enable {
+			switch part.Authentication.Type {
+			case "keyAuth":
+				pluginMap["key-auth"] = part.Authentication.KeyAuth
+			case "basicAuth":
+				pluginMap["basic-auth"] = make(map[string]interface{})
+			default:
+				pluginMap["basic-auth"] = make(map[string]interface{})
+			}
+		}
+
+		var exprs [][]apisixv1.StringOrSlice
+		if part.Match.NginxVars != nil {
+			exprs, err = t.translateRouteMatchExprs(part.Match.NginxVars)
+			if err != nil {
+				log.Errorw("ApisixRoute with bad nginxVars",
+					zap.Error(err),
+					zap.Any("ApisixRoute", ar),
+				)
+				return err
+			}
+		}
+		if err := validateRemoteAddrs(part.Match.RemoteAddrs); err != nil {
+			log.Errorw("ApisixRoute with invalid remote addrs",
+				zap.Error(err),
+				zap.Strings("remote_addrs", part.Match.RemoteAddrs),
+				zap.Any("ApisixRoute", ar),
+			)
+			return err
+		}
+
+		upstreamName := apisixv1.ComposeUpstreamName(ar.Namespace, backend.ServiceName, backend.Subset, svcPort)
+		route := apisixv1.NewDefaultRoute()
+		route.Name = apisixv1.ComposeRouteName(ar.Namespace, ar.Name, part.Name)
+		route.ID = id.GenID(route.Name)
+		route.Priority = part.Priority
+		route.RemoteAddrs = part.Match.RemoteAddrs
+		route.Vars = exprs
+		route.Hosts = part.Match.Hosts
+		route.Uris = part.Match.Paths
+		route.Methods = part.Match.Methods
+		route.UpstreamId = id.GenID(upstreamName)
+		route.EnableWebsocket = part.Websocket
+		route.Plugins = pluginMap
+
+		if len(backends) > 0 {
+			weight := _defaultWeight
+			if backend.Weight != nil {
+				weight = *backend.Weight
+			}
+			plugin, err := t.translateTrafficSplitPlugin(ctx, ar.Namespace, weight, backends)
+			if err != nil {
+				log.Errorw("failed to translate traffic-split plugin",
+					zap.Error(err),
+					zap.Any("ApisixRoute", ar),
+				)
+				return err
+			}
+			route.Plugins["traffic-split"] = plugin
+		}
+		ctx.addRoute(route)
+		if !ctx.checkUpstreamExist(upstreamName) {
+			ups, err := t.translateUpstream(ar.Namespace, backend.ServiceName, backend.Subset, backend.ResolveGranularity, svcClusterIP, svcPort)
+			if err != nil {
+				return err
+			}
+			ctx.addUpstream(ups)
+		}
 	}
-	return routes, upstreams, nil
+	return nil
 }
 
 func (t *translator) translateRouteMatchExprs(nginxVars []configv2alpha1.ApisixRouteHTTPMatchExpr) ([][]apisixv1.StringOrSlice, error) {
@@ -237,9 +412,7 @@ func (t *translator) translateRouteMatchExprs(nginxVars []configv2alpha1.ApisixR
 			name = strings.ReplaceAll(name, "-", "_")
 			subj = "http_" + name
 		case configv2alpha1.ScopeCookie:
-			name := strings.ToLower(expr.Subject.Name)
-			name = strings.ReplaceAll(name, "-", "_")
-			subj = "cookie_" + name
+			subj = "cookie_" + expr.Subject.Name
 		case configv2alpha1.ScopePath:
 			subj = "uri"
 		default:
@@ -315,4 +488,142 @@ func (t *translator) translateRouteMatchExprs(nginxVars []configv2alpha1.ApisixR
 	}
 
 	return vars, nil
+}
+
+// translateTCPRouteNotStrictly translates tcp route with a loose way, only generate ID and Name for delete Event.
+func (t *translator) translateTCPRouteNotStrictly(ctx *TranslateContext, ar *configv2alpha1.ApisixRoute) error {
+	for _, part := range ar.Spec.TCP {
+		backend := &part.Backend
+		sr := apisixv1.NewDefaultStreamRoute()
+		name := apisixv1.ComposeStreamRouteName(ar.Namespace, ar.Name, part.Name)
+		sr.ID = id.GenID(name)
+		sr.ServerPort = part.Match.IngressPort
+		ups, err := t.translateUpstreamNotStrictly(ar.Namespace, backend.ServiceName, backend.Subset, backend.ServicePort.IntVal)
+		if err != nil {
+			return err
+		}
+		sr.UpstreamId = ups.ID
+		ctx.addStreamRoute(sr)
+		if !ctx.checkUpstreamExist(ups.Name) {
+			ctx.addUpstream(ups)
+		}
+	}
+	return nil
+}
+
+func (t *translator) translateStreamRoute(ctx *TranslateContext, ar *configv2beta1.ApisixRoute) error {
+	ruleNameMap := make(map[string]struct{})
+	for _, part := range ar.Spec.Stream {
+		if _, ok := ruleNameMap[part.Name]; ok {
+			return errors.New("duplicated route rule name")
+		}
+		ruleNameMap[part.Name] = struct{}{}
+		backend := part.Backend
+		svcClusterIP, svcPort, err := t.getStreamServiceClusterIPAndPort(backend, ar.Namespace)
+		if err != nil {
+			log.Errorw("failed to get service port in backend",
+				zap.Any("backend", backend),
+				zap.Any("apisix_route", ar),
+				zap.Error(err),
+			)
+			return err
+		}
+		sr := apisixv1.NewDefaultStreamRoute()
+		name := apisixv1.ComposeStreamRouteName(ar.Namespace, ar.Name, part.Name)
+		sr.ID = id.GenID(name)
+		sr.ServerPort = part.Match.IngressPort
+		ups, err := t.translateUpstream(ar.Namespace, backend.ServiceName, backend.Subset, backend.ResolveGranularity, svcClusterIP, svcPort)
+		if err != nil {
+			return err
+		}
+		sr.UpstreamId = ups.ID
+		ctx.addStreamRoute(sr)
+		if !ctx.checkUpstreamExist(ups.Name) {
+			ctx.addUpstream(ups)
+		}
+
+	}
+	return nil
+}
+
+func (t *translator) translateTCPRoute(ctx *TranslateContext, ar *configv2alpha1.ApisixRoute) error {
+	ruleNameMap := make(map[string]struct{})
+	for _, part := range ar.Spec.TCP {
+		if _, ok := ruleNameMap[part.Name]; ok {
+			return errors.New("duplicated route rule name")
+		}
+		ruleNameMap[part.Name] = struct{}{}
+		backend := &part.Backend
+		svcClusterIP, svcPort, err := t.getTCPServiceClusterIPAndPort(backend, ar)
+		if err != nil {
+			log.Errorw("failed to get service port in backend",
+				zap.Any("backend", backend),
+				zap.Any("apisix_route", ar),
+				zap.Error(err),
+			)
+			return err
+		}
+		sr := apisixv1.NewDefaultStreamRoute()
+		name := apisixv1.ComposeStreamRouteName(ar.Namespace, ar.Name, part.Name)
+		sr.ID = id.GenID(name)
+		sr.ServerPort = part.Match.IngressPort
+		ups, err := t.translateUpstream(ar.Namespace, backend.ServiceName, backend.Subset, backend.ResolveGranularity, svcClusterIP, svcPort)
+		if err != nil {
+			return err
+		}
+		sr.UpstreamId = ups.ID
+		ctx.addStreamRoute(sr)
+		if !ctx.checkUpstreamExist(ups.Name) {
+			ctx.addUpstream(ups)
+		}
+
+	}
+	return nil
+}
+
+// translateHTTPRouteV2beta1NotStrictly translates http route with a loose way, only generate ID and Name for delete Event.
+func (t *translator) translateHTTPRouteV2beta1NotStrictly(ctx *TranslateContext, ar *configv2beta1.ApisixRoute) error {
+	for _, part := range ar.Spec.HTTP {
+		backends := part.Backends
+		backend := part.Backend
+		if len(backends) > 0 {
+			// Use the first backend as the default backend in Route,
+			// others will be configured in traffic-split plugin.
+			backend = backends[0]
+		} // else use the deprecated Backend.
+		upstreamName := apisixv1.ComposeUpstreamName(ar.Namespace, backend.ServiceName, backend.Subset, backend.ServicePort.IntVal)
+		route := apisixv1.NewDefaultRoute()
+		route.Name = apisixv1.ComposeRouteName(ar.Namespace, ar.Name, part.Name)
+		route.ID = id.GenID(route.Name)
+		ctx.addRoute(route)
+		if !ctx.checkUpstreamExist(upstreamName) {
+			ups, err := t.translateUpstreamNotStrictly(ar.Namespace, backend.ServiceName, backend.Subset, backend.ServicePort.IntVal)
+			if err != nil {
+				return err
+			}
+			ctx.addUpstream(ups)
+		}
+	}
+	return nil
+}
+
+// translateStreamRouteNotStrictly translates tcp route with a loose way, only generate ID and Name for delete Event.
+func (t *translator) translateStreamRouteNotStrictly(ctx *TranslateContext, ar *configv2beta1.ApisixRoute) error {
+	for _, part := range ar.Spec.Stream {
+		backend := &part.Backend
+		sr := apisixv1.NewDefaultStreamRoute()
+		name := apisixv1.ComposeStreamRouteName(ar.Namespace, ar.Name, part.Name)
+		sr.ID = id.GenID(name)
+		sr.ServerPort = part.Match.IngressPort
+		ups, err := t.translateUpstreamNotStrictly(ar.Namespace, backend.ServiceName, backend.Subset, backend.ServicePort.IntVal)
+		if err != nil {
+			return err
+		}
+		sr.UpstreamId = ups.ID
+		ctx.addStreamRoute(sr)
+		if !ctx.checkUpstreamExist(ups.Name) {
+			ctx.addUpstream(ups)
+		}
+	}
+	return nil
 }
