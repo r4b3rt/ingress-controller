@@ -1,0 +1,17 @@
+apiVersion: apisix.apache.org/v2
+kind: ApisixUpstream
+metadata:
+  labels:
+    app.kubernetes.io/name: apisix-ingress-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: apisixupstream-sample
+spec:
+  ingressClassName: apisix
+  scheme: http
+  retries: 2
+  loadbalancer:
+    type: roundrobin
+  timeout:
+    connect: 5s
+    read: 10s
+    send: 10s

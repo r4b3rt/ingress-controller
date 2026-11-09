@@ -1,0 +1,226 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package translator
+
+import (
+	"fmt"
+	"sort"
+
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	adctypes "github.com/apache/apisix-ingress-controller/api/adc"
+	apiv2 "github.com/apache/apisix-ingress-controller/api/v2"
+	"github.com/apache/apisix-ingress-controller/internal/controller/label"
+	"github.com/apache/apisix-ingress-controller/internal/id"
+	"github.com/apache/apisix-ingress-controller/internal/provider"
+	"github.com/apache/apisix-ingress-controller/internal/types"
+)
+
+func newDefaultUpstreamWithoutScheme() *adctypes.Upstream {
+	return &adctypes.Upstream{
+		Metadata: adctypes.Metadata{
+			Labels: map[string]string{
+				"managed-by": "apisix-ingress-controller",
+			},
+		},
+		Nodes: make(adctypes.UpstreamNodes, 0),
+	}
+}
+
+// listenerPortSet returns the de-duplicated set of ports of the listeners the
+// route attaches to. tctx.Listeners is populated by the controller from the
+// listeners that ParseRouteParentRefs already matched against the route's
+// parentRefs (honoring sectionName, port, protocol and allowedRoutes).
+func listenerPortSet(tctx *provider.TranslateContext) map[int32]struct{} {
+	portSet := make(map[int32]struct{}, len(tctx.Listeners))
+	for _, listener := range tctx.Listeners {
+		portSet[listener.Port] = struct{}{}
+	}
+	return portSet
+}
+
+// buildL4StreamRoutes builds the StreamRoutes for one L4 route rule.
+//
+// A StreamRoute without a server_port match matches every connection on any
+// stream listener, so multiple L4 routes collide onto one backend (#2802). To
+// isolate them we set server_port from the matched listener port(s), emitting one
+// StreamRoute per port.
+//
+// Whether to inject server_port is gated by shouldInjectServerPortVars (the same
+// listener_port_match_mode used by HTTPRoute/GRPCRoute): the listener port is a
+// logical Gateway value that must equal APISIX's physical stream listen port for
+// the match to work, so injection is opt-in (explicit sectionName/port targeting,
+// or more than one listener port). When it is not injected we keep the previous
+// single portless StreamRoute, preserving backward compatibility.
+func (t *Translator) buildL4StreamRoutes(tctx *provider.TranslateContext, namespace, name string, ruleIndex int, typ, routeKind string, labels map[string]string) ([]*adctypes.StreamRoute, error) {
+	var ports []int32
+	if portSet := listenerPortSet(tctx); t.shouldInjectServerPortVars(tctx.HasExplicitListenerMatch, portSet) {
+		ports = make([]int32, 0, len(portSet))
+		for port := range portSet {
+			ports = append(ports, port)
+		}
+		sort.Slice(ports, func(i, j int) bool { return ports[i] < ports[j] })
+	}
+	if len(ports) == 0 {
+		// No server_port isolation: a single StreamRoute that matches all
+		// connections on the stream listener, as before.
+		ports = []int32{0}
+	}
+	streamRoutes := make([]*adctypes.StreamRoute, 0, len(ports))
+	for _, port := range ports {
+		streamRoute := adctypes.NewDefaultStreamRoute()
+		ruleKey := fmt.Sprintf("%d", ruleIndex)
+		if port != 0 {
+			// Include the port in the name key so multiple listeners produce
+			// distinct StreamRoute names/IDs instead of colliding.
+			ruleKey = fmt.Sprintf("%d-%d", ruleIndex, port)
+			streamRoute.ServerPort = port
+		}
+		streamRouteName := adctypes.ComposeStreamRouteName(namespace, name, ruleKey, typ)
+		streamRoute.Name = streamRouteName
+		streamRoute.ID = id.GenID(streamRouteName)
+		streamRoute.Labels = labels
+		// Attach L4RoutePolicy plugins at the stream_route level: the APISIX stream proxy
+		// applies plugins from the stream_route, not from the service.
+		streamRoute.Plugins = make(adctypes.Plugins)
+		if err := t.AttachL4RoutePolicyPlugins(tctx.L4RoutePolicies, namespace, name, routeKind, streamRoute.Plugins, tctx.Secrets); err != nil {
+			return nil, err
+		}
+		streamRoutes = append(streamRoutes, streamRoute)
+	}
+	return streamRoutes, nil
+}
+
+func (t *Translator) TranslateTCPRoute(tctx *provider.TranslateContext, tcpRoute *gatewayv1.TCPRoute) (*TranslateResult, error) {
+	result := &TranslateResult{}
+	rules := tcpRoute.Spec.Rules
+	labels := label.GenLabel(tcpRoute)
+	for ruleIndex, rule := range rules {
+		service := adctypes.NewDefaultService()
+		service.Labels = labels
+		service.Name = adctypes.ComposeServiceNameWithStream(tcpRoute.Namespace, tcpRoute.Name, fmt.Sprintf("%d", ruleIndex), "TCP")
+		service.ID = id.GenID(service.Name)
+		var (
+			upstreams         = make([]*adctypes.Upstream, 0)
+			weightedUpstreams = make([]adctypes.TrafficSplitConfigRuleWeightedUpstream, 0)
+		)
+		for _, backend := range rule.BackendRefs {
+			if backend.Namespace == nil {
+				namespace := gatewayv1.Namespace(tcpRoute.Namespace)
+				backend.Namespace = &namespace
+			}
+			upstream := newDefaultUpstreamWithoutScheme()
+			upNodes, _, err := t.translateBackendRef(tctx, backend, DefaultEndpointFilter)
+			if err != nil {
+				continue
+			}
+			if len(upNodes) == 0 {
+				continue
+			}
+			t.AttachBackendTrafficPolicyToUpstream(backend, tctx.BackendTrafficPolicies, upstream, tctx.Services)
+			upstream.Nodes = upNodes
+			var (
+				kind string
+				port int32
+			)
+			if backend.Kind == nil {
+				kind = types.KindService
+			} else {
+				kind = string(*backend.Kind)
+			}
+			if backend.Port != nil {
+				port = *backend.Port
+			}
+			namespace := string(*backend.Namespace)
+			name := string(backend.Name)
+			upstreamName := adctypes.ComposeUpstreamNameForBackendRef(kind, namespace, name, port)
+			upstream.Name = upstreamName
+			upstream.ID = id.GenID(upstreamName)
+			upstreams = append(upstreams, upstream)
+		}
+
+		// Handle multiple backends with traffic-split plugin
+		if len(upstreams) == 0 {
+			// Create a default upstream if no valid backends
+			upstream := adctypes.NewDefaultUpstream()
+			service.Upstream = upstream
+		} else if len(upstreams) == 1 {
+			// Single backend - use directly as service upstream
+			service.Upstream = upstreams[0]
+			// remove the id and name of the service.upstream, adc schema does not need id and name for it
+			service.Upstream.ID = ""
+			service.Upstream.Name = ""
+		} else {
+			// Multiple backends - use traffic-split plugin
+			service.Upstream = upstreams[0]
+			// remove the id and name of the service.upstream, adc schema does not need id and name for it
+			service.Upstream.ID = ""
+			service.Upstream.Name = ""
+
+			upstreams = upstreams[1:]
+
+			if len(upstreams) > 0 {
+				service.Upstreams = upstreams
+			}
+
+			// Set weight in traffic-split for the default upstream
+			weight := apiv2.DefaultWeight
+			if rule.BackendRefs[0].Weight != nil {
+				weight = int(*rule.BackendRefs[0].Weight)
+			}
+			weightedUpstreams = append(weightedUpstreams, adctypes.TrafficSplitConfigRuleWeightedUpstream{
+				Weight: weight,
+			})
+
+			// Set other upstreams in traffic-split using upstream_id
+			for i, upstream := range upstreams {
+				weight := apiv2.DefaultWeight
+				// get weight from the backend refs starting from the second backend
+				if i+1 < len(rule.BackendRefs) && rule.BackendRefs[i+1].Weight != nil {
+					weight = int(*rule.BackendRefs[i+1].Weight)
+				}
+				weightedUpstreams = append(weightedUpstreams, adctypes.TrafficSplitConfigRuleWeightedUpstream{
+					UpstreamID: upstream.ID,
+					Weight:     weight,
+				})
+			}
+
+			if len(weightedUpstreams) > 0 {
+				if service.Plugins == nil {
+					service.Plugins = make(map[string]any)
+				}
+				service.Plugins["traffic-split"] = &adctypes.TrafficSplitConfig{
+					Rules: []adctypes.TrafficSplitConfigRule{
+						{
+							WeightedUpstreams: weightedUpstreams,
+						},
+					},
+				}
+			}
+		}
+		// TODO: support remote_addr, server_addr, sni
+		streamRoutes, err := t.buildL4StreamRoutes(tctx, tcpRoute.Namespace, tcpRoute.Name, ruleIndex, "TCP", "TCPRoute", labels)
+		if err != nil {
+			return nil, err
+		}
+		service.StreamRoutes = streamRoutes
+
+		result.Services = append(result.Services, service)
+	}
+	return result, nil
+}

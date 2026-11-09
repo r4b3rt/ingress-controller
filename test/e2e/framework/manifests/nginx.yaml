@@ -1,0 +1,206 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+data:
+  nginx.conf: |
+    worker_processes 1;
+    pid /run/nginx.pid;
+
+    events {
+      worker_connections  1024;
+    }
+
+    http {
+      server {
+        listen 80 default_server;
+        listen 443 ssl default_server;
+
+        ssl_certificate /etc/nginx/ssl/tls.crt;
+        ssl_certificate_key /etc/nginx/ssl/tls.key;
+        ssl_client_certificate /etc/nginx/ssl/ca.crt;
+
+        add_header X-Port $server_port;
+        add_header X-Host $host;
+        location / {
+          return 200 'Hello, World!';
+        }
+
+        location /delay {
+          content_by_lua_block {
+            local delay = tonumber(ngx.var.arg_delay) or 0
+            ngx.sleep(delay)
+            ngx.say("Slept for ", delay, " seconds")
+          }
+        }
+
+        location /auth {
+          content_by_lua_block {
+            local auth = ngx.req.get_headers()["Authorization"]
+            if auth == "123" then
+              ngx.header["X-User-ID"] = "user-123"
+              ngx.exit(200)
+            else
+              ngx.header["Location"] = "http://example.com/auth"
+              ngx.exit(401)
+            end
+          }
+        }
+
+        location /ws {
+          content_by_lua_block {
+            local server = require "resty.websocket.server"
+            local wb, err = server:new {
+              timeout = 5000,          -- 5 seconds timeout
+              max_payload_len = 65535  -- max message length
+            }
+            if not wb then
+              ngx.log(ngx.ERR, "failed to create websocket: ", err)
+              return ngx.exit(444)
+            end
+
+            while true do
+              local data, typ, err = wb:recv_frame()
+              if wb.fatal then
+                ngx.log(ngx.ERR, "failed to receive frame: ", err)
+                break
+              end
+
+              if typ == "close" then
+                wb:send_close()
+                break
+              elseif typ == "text" then
+                wb:send_text(data)   -- echo text
+              elseif typ == "binary" then
+                wb:send_binary(data) -- echo binary
+              elseif typ == "ping" then
+                wb:send_pong()
+              end
+            end
+          }
+        }
+      }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: {{ .Replicas | default 1 }}
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: nginx-config
+        - name: nginx-ssl
+          secret:
+            secretName: nginx-ssl
+      containers:
+        - livenessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            successThreshold: 1
+            httpGet:
+              path: /healthz
+              port: 80
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          image: "openresty/openresty:1.27.1.2-4-bullseye-fat"
+          imagePullPolicy: IfNotPresent
+          name: nginx
+          ports:
+            - containerPort: 80
+              name: "http"
+              protocol: "TCP"
+            - containerPort: 443
+              name: "https"
+              protocol: "TCP"
+          volumeMounts:
+            - mountPath: /usr/local/openresty/nginx/conf/nginx.conf
+              name: nginx-config
+              subPath: nginx.conf
+            - mountPath: /etc/nginx/ssl
+              name: nginx-ssl
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+spec:
+  selector:
+    app: nginx
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 80
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: 443
+      appProtocol: https
+    - name: https-v2
+      port: 7443
+      protocol: TCP
+      targetPort: 443
+    - name: ws
+      port: 8080
+      protocol: TCP
+      targetPort: 80
+      appProtocol: kubernetes.io/ws
+    - name: wss
+      port: 8443
+      protocol: TCP
+      targetPort: 443
+      appProtocol: kubernetes.io/wss
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx2
+spec:
+  selector:
+    app: nginx
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 80
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: 443
+  type: ClusterIP

@@ -1,0 +1,66 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package manager
+
+import (
+	"context"
+
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+
+	webhookv1 "github.com/apache/apisix-ingress-controller/internal/webhook/v1"
+)
+
+func setupWebhooks(_ context.Context, mgr manager.Manager) error {
+	if err := webhookv1.SetupIngressWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupIngressClassWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupGatewayWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupGatewayProxyWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupHTTPRouteWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupGRPCRouteWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupTCPRouteWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupUDPRouteWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupApisixConsumerWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupApisixTlsWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupApisixRouteWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	if err := webhookv1.SetupConsumerWebhookWithManager(mgr); err != nil {
+		return err
+	}
+	return nil
+}

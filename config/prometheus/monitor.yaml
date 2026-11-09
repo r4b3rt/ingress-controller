@@ -1,0 +1,21 @@
+# Prometheus Monitor Service (Metrics)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: apisix-ingress-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager-metrics-monitor
+  namespace: system
+spec:
+  endpoints:
+    # The metrics endpoint is served over plain HTTP by default. When
+    # `secure_metrics` is enabled in config/manager/config.yaml, switch the
+    # scheme to https, add the bearer token file and configure tlsConfig.
+    - path: /metrics
+      port: metrics
+      scheme: http
+  selector:
+    matchLabels:
+      control-plane: controller-manager

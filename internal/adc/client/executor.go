@@ -1,0 +1,473 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/go-logr/logr"
+	"k8s.io/utils/ptr"
+
+	adctypes "github.com/apache/apisix-ingress-controller/api/adc"
+	"github.com/apache/apisix-ingress-controller/internal/types"
+)
+
+const (
+	defaultHTTPADCExecutorAddr = "http://127.0.0.1:3000"
+
+	pathSync     = "/sync"
+	pathValidate = "/validate"
+
+	// BackendAPISIXStandalone is the one backend type this package resolves a
+	// multi-address ServerAddrs into a single joined sync target for. It is exported so
+	// apisixProvider, which owns the conf_version rebuild decision, can recognize the
+	// same backend type without repeating the string.
+	BackendAPISIXStandalone = "apisix-standalone"
+)
+
+type ADCExecutor interface {
+	// Execute performs one sync and returns the raw HTTP status ADC answered with (0 if
+	// the call never got a response at all, e.g. a transport failure) alongside the
+	// parsed error, if any. The status code is for Client.Sync's own metrics; nothing
+	// outside this package ever sees it.
+	Execute(ctx context.Context, config adctypes.Config, resources *adctypes.Resources, labels map[string]string, resourceTypes []string) (statusCode int, err error)
+	Validate(ctx context.Context, config adctypes.Config, resources *adctypes.Resources, labels map[string]string, resourceTypes []string) error
+}
+
+// ADCServerRequest represents the request body for ADC Server /sync endpoint
+type ADCServerRequest struct {
+	Task ADCServerTask `json:"task"`
+}
+
+// ADCServerTask represents the task configuration in ADC Server request
+type ADCServerTask struct {
+	Opts   ADCServerOpts      `json:"opts"`
+	Config adctypes.Resources `json:"config"`
+}
+
+// ADCServerOpts represents the options in ADC Server task
+type ADCServerOpts struct {
+	Backend             string            `json:"backend"`
+	Server              []string          `json:"server"`
+	Token               string            `json:"token"`
+	LabelSelector       map[string]string `json:"labelSelector,omitempty"`
+	IncludeResourceType []string          `json:"includeResourceType,omitempty"`
+	TlsSkipVerify       *bool             `json:"tlsSkipVerify,omitempty"`
+	// CaCert is the PEM-encoded CA certificate (or bundle) the ADC server verifies
+	// the control plane against. Older ADC servers ignore it, and omitempty keeps
+	// requests without a CA bundle byte for byte what they were.
+	CaCert   string `json:"caCert,omitempty"`
+	CacheKey string `json:"cacheKey"`
+	// BypassCache is only accepted by the /sync task of ADC >= 0.27.0. Both ADC task
+	// schemas reject unknown fields, so omitempty is what keeps every other request,
+	// /validate, and every sync that is not recovering from a rejection, byte for byte
+	// what an older ADC server already accepts.
+	BypassCache bool `json:"bypassCache,omitempty"`
+}
+
+// MarshalLog implements logr.Marshaler so logging the request body redacts the
+// AdminKey token and the secret-bearing config resources. It affects logging
+// only, not the JSON actually sent to the ADC server.
+func (r ADCServerRequest) MarshalLog() any {
+	return map[string]any{
+		"backend":             r.Task.Opts.Backend,
+		"server":              r.Task.Opts.Server,
+		"token":               "[REDACTED]",
+		"labelSelector":       r.Task.Opts.LabelSelector,
+		"includeResourceType": r.Task.Opts.IncludeResourceType,
+		"tlsSkipVerify":       r.Task.Opts.TlsSkipVerify,
+		"hasCaCert":           r.Task.Opts.CaCert != "",
+		"cacheKey":            r.Task.Opts.CacheKey,
+		"config":              r.Task.Config.MarshalLog(),
+	}
+}
+
+type ADCValidateResult struct {
+	Success      *bool                       `json:"success,omitempty"`
+	ErrorMessage string                      `json:"message,omitempty"`
+	Errors       []types.ADCValidationDetail `json:"errors,omitempty"`
+}
+
+// HTTPADCExecutor implements ADCExecutor interface using HTTP calls to ADC Server
+type HTTPADCExecutor struct {
+	httpClient *http.Client
+	serverURL  string
+	log        logr.Logger
+}
+
+// NewHTTPADCExecutor creates a new HTTPADCExecutor with the specified ADC Server URL.
+// serverURL can be "http(s)://host:port" or "unix:///path/to/socket" or "unix:/path/to/socket".
+func NewHTTPADCExecutor(log logr.Logger, serverURL string, timeout time.Duration) *HTTPADCExecutor {
+	httpClient := &http.Client{
+		Timeout: timeout,
+	}
+
+	if strings.HasPrefix(serverURL, "unix:") {
+		var socketPath string
+		if strings.HasPrefix(serverURL, "unix:///") {
+			socketPath = strings.TrimPrefix(serverURL, "unix://")
+		} else {
+			socketPath = strings.TrimPrefix(serverURL, "unix:")
+		}
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		}
+		httpClient.Transport = transport
+		serverURL = "http://unix"
+	}
+
+	return &HTTPADCExecutor{
+		httpClient: httpClient,
+		serverURL:  serverURL,
+		log:        log.WithName("executor"),
+	}
+}
+
+// Execute implements the ADCExecutor interface using HTTP calls
+func (e *HTTPADCExecutor) Execute(ctx context.Context, config adctypes.Config, resources *adctypes.Resources, labels map[string]string, resourceTypes []string) (int, error) {
+	return e.runHTTPSync(ctx, config, resources, labels, resourceTypes)
+}
+
+func (e *HTTPADCExecutor) Validate(ctx context.Context, config adctypes.Config, resources *adctypes.Resources, labels map[string]string, resourceTypes []string) error {
+	return e.runHTTPValidate(ctx, config, resources, labels, resourceTypes)
+}
+
+// runHTTPSync sends config in one /sync request and returns the parsed failure, if any.
+// A sync is one request whatever config.ServerAddrs holds: apisix-standalone joins every
+// entry with commas because ADC addresses them together as one logical destination
+// (buildHTTPRequest splits them back apart into the request body), every other backend
+// type takes the first entry only, since a GatewayProxy is expected to resolve to one
+// address there even though nothing enforces it yet. Deciding how many addresses a
+// GatewayProxy has belongs to the caller that built config.ServerAddrs.
+//
+// A GatewayProxy with no resolved address is a sync failure for apisix-standalone (the
+// data plane it configures is unreachable, e.g. scaled to zero), and a no-op for every
+// other backend type, which pushes per address and so has nothing to push.
+//
+// This package never decides whether to retry the failure; callers interpret it and ask
+// again if they choose to. The returned status code is 0 whenever no HTTP response came
+// back at all (no address to sync to, or the request never reached ADC or got answered).
+func (e *HTTPADCExecutor) runHTTPSync(ctx context.Context, config adctypes.Config, resources *adctypes.Resources, labels map[string]string, resourceTypes []string) (int, error) {
+	standalone := config.BackendType == BackendAPISIXStandalone
+	if len(config.ServerAddrs) == 0 {
+		if standalone {
+			return 0, types.ADCExecutionServerAddrError{Err: "no data plane address to sync apisix-standalone config to"}
+		}
+		return 0, nil
+	}
+
+	target := syncTargetAddr(config)
+	e.log.V(1).Info("running http sync", "server", target)
+
+	ctx, cancel := context.WithTimeout(ctx, e.httpClient.Timeout)
+	defer cancel()
+
+	req, err := e.buildHTTPRequest(ctx, target, config, labels, resourceTypes, resources, pathSync)
+	if err != nil {
+		return 0, types.ADCExecutionServerAddrError{ServerAddr: target, Err: fmt.Sprintf("failed to build HTTP request: %s", err)}
+	}
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return 0, types.ADCExecutionServerAddrError{ServerAddr: target, Err: fmt.Sprintf("failed to send HTTP request: %s", err)}
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			e.log.Error(closeErr, "failed to close response body")
+		}
+	}()
+
+	if err := e.handleHTTPResponse(resp, target); err != nil {
+		e.log.Error(err, "failed to run http sync", "server", target)
+		return resp.StatusCode, err
+	}
+	return resp.StatusCode, nil
+}
+
+// syncTargetAddr resolves config.ServerAddrs into what one /sync request targets. Callers
+// must have already handled an empty ServerAddrs (see runHTTPSync).
+func syncTargetAddr(config adctypes.Config) string {
+	if config.BackendType == BackendAPISIXStandalone {
+		return strings.Join(config.ServerAddrs, ",")
+	}
+	return config.ServerAddrs[0]
+}
+
+func (e *HTTPADCExecutor) runHTTPValidate(ctx context.Context, config adctypes.Config, resources *adctypes.Resources, labels map[string]string, resourceTypes []string) error {
+	var validationErr = types.ADCValidationError{
+		Name: config.Name,
+	}
+	var infraErrs []error
+
+	serverAddrs := func() []string {
+		return config.ServerAddrs
+	}()
+	e.log.V(1).Info("running http validate", "serverAddrs", serverAddrs)
+
+	for _, addr := range serverAddrs {
+		if err := e.runHTTPValidateForSingleServer(ctx, addr, config, resources, labels, resourceTypes); err != nil {
+			e.log.Error(err, "failed to run http validate for server", "server", addr)
+			var validationServerErr types.ADCValidationServerAddrError
+			if errors.As(err, &validationServerErr) {
+				validationErr.FailedErrors = append(validationErr.FailedErrors, validationServerErr)
+				continue
+			}
+			infraErrs = append(infraErrs, err)
+		}
+	}
+
+	if len(validationErr.FailedErrors) > 0 {
+		return validationErr
+	}
+	if len(infraErrs) > 0 {
+		return errors.Join(infraErrs...)
+	}
+	return nil
+}
+
+func (e *HTTPADCExecutor) runHTTPValidateForSingleServer(ctx context.Context, serverAddr string, config adctypes.Config, resources *adctypes.Resources, labels map[string]string, resourceTypes []string) error {
+	ctx, cancel := context.WithTimeout(ctx, e.httpClient.Timeout)
+	defer cancel()
+
+	req, err := e.buildHTTPRequest(ctx, serverAddr, config, labels, resourceTypes, resources, pathValidate)
+	if err != nil {
+		return fmt.Errorf("failed to build validate request: %w", err)
+	}
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send HTTP request: %w", err)
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			e.log.Error(closeErr, "failed to close response body")
+		}
+	}()
+
+	return e.handleHTTPValidateResponse(resp, serverAddr)
+}
+
+// buildHTTPRequest builds the HTTP request for ADC Server
+func (e *HTTPADCExecutor) buildHTTPRequest(ctx context.Context, serverAddr string, config adctypes.Config, labels map[string]string, resourceTypes []string, resources *adctypes.Resources, path string) (*http.Request, error) {
+	// Prepare request body
+	tlsVerify := config.TlsVerify
+	bypassCache := path == pathSync && config.BypassCache
+	reqBody := ADCServerRequest{
+		Task: ADCServerTask{
+			Opts: ADCServerOpts{
+				Backend:             config.BackendType,
+				Server:              strings.Split(serverAddr, ","),
+				Token:               config.Token,
+				LabelSelector:       labels,
+				IncludeResourceType: resourceTypes,
+				TlsSkipVerify:       ptr.To(!tlsVerify),
+				CaCert:              config.CaCert,
+				CacheKey:            config.Name,
+				BypassCache:         bypassCache,
+			},
+			Config: *resources,
+		},
+	}
+
+	e.log.V(1).Info("prepared request body", "body", reqBody)
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	e.log.V(1).Info("sending HTTP request to ADC Server",
+		"url", e.serverURL+path,
+		"server", serverAddr,
+		"mode", config.BackendType,
+		"cacheKey", config.Name,
+		"bypassCache", bypassCache,
+		"labelSelector", labels,
+		"includeResourceType", resourceTypes,
+		"tlsSkipVerify", !tlsVerify,
+		"hasCaCert", config.CaCert != "",
+	)
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, e.serverURL+path, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	return req, nil
+}
+
+// distinctReasons joins every distinct, non-empty reason in failed, in the order first
+// seen: several resources failing for the exact same reason (a rejected conf_version,
+// say) still reports it once.
+func distinctReasons(failed []adctypes.SyncStatus) string {
+	seen := make(map[string]bool, len(failed))
+	reasons := make([]string, 0, len(failed))
+	for _, f := range failed {
+		if f.Reason != "" && !seen[f.Reason] {
+			seen[f.Reason] = true
+			reasons = append(reasons, f.Reason)
+		}
+	}
+	return strings.Join(reasons, "; ")
+}
+
+// handleHTTPResponse handles the HTTP response from ADC Server
+func (e *HTTPADCExecutor) handleHTTPResponse(resp *http.Response, serverAddr string) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	e.log.V(1).Info("received HTTP response from ADC Server",
+		"server", serverAddr,
+		"status", resp.StatusCode,
+		"response", string(body),
+	)
+
+	// ADC Server's /sync status codes:
+	//   - 200: apisix-standalone, every server took and confirmed the write.
+	//   - 202: apisix/api7ee always (no confirm concept); apisix-standalone when every
+	//     server took the write but not every one confirmed it, or one server rejected
+	//     it while others accepted.
+	//   - 400: malformed request, unrelated to any backend's content rejection (see 422).
+	//   - 413: request body over the fixed 100 MB limit.
+	//   - 422: apisix-standalone, every server ended up success:false on the write itself
+	//     (rejected the content, unreachable, or a mix; concurrent writes aren't
+	//     cancelled on the first failure).
+	//   - 500: ADC Server failed before attempting the write at all (e.g. can't reach any
+	//     server to fetch the current remote state), never a verdict on the write.
+	// Only 200/202/422 carry a SyncResult body; the other three shouldn't be parsed as
+	// one: most fields are optional, so an unrelated shape can unmarshal as an empty,
+	// unremarkable "success".
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusAccepted, http.StatusUnprocessableEntity:
+	default:
+		return types.ADCExecutionServerAddrError{
+			ServerAddr: serverAddr,
+			Err:        fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
+		}
+	}
+
+	var result adctypes.SyncResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("failed to unmarshal response body: %s, err: %w", string(body), err)
+	}
+
+	if len(result.Failed) > 0 {
+		reason := distinctReasons(result.Failed)
+		e.log.Error(fmt.Errorf("ADC Server sync failed: %s", reason), "ADC Server sync failed", "result", result)
+		return types.ADCExecutionServerAddrError{
+			ServerAddr:       serverAddr,
+			Err:              reason,
+			FailedStatuses:   result.Failed,
+			EndpointStatuses: result.EndpointStatus,
+		}
+	}
+
+	var failedEndpoints []string
+	for _, ep := range result.EndpointStatus {
+		if !ep.Success {
+			failedEndpoints = append(failedEndpoints, fmt.Sprintf("%s: %s", ep.Server, ep.Reason))
+		}
+	}
+	if len(failedEndpoints) > 0 {
+		reason := strings.Join(failedEndpoints, "; ")
+		e.log.Error(fmt.Errorf("ADC Server sync failed (standalone mode): %s", reason), "ADC Server sync failed", "result", result)
+		return types.ADCExecutionServerAddrError{
+			ServerAddr:       serverAddr,
+			Err:              reason,
+			EndpointStatuses: result.EndpointStatus,
+		}
+	}
+
+	e.log.V(1).Info("ADC Server sync success", "result", result)
+	return nil
+}
+
+func (e *HTTPADCExecutor) handleHTTPValidateResponse(resp *http.Response, serverAddr string) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	e.log.V(1).Info("received HTTP validate response from ADC Server",
+		"server", serverAddr,
+		"status", resp.StatusCode,
+		"response", string(body),
+	)
+
+	parseValidationResult := func() *ADCValidateResult {
+		if len(body) == 0 {
+			return nil
+		}
+		var result ADCValidateResult
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil
+		}
+		return &result
+	}
+
+	if resp.StatusCode == http.StatusBadRequest {
+		result := parseValidationResult()
+		errMsg := string(body)
+		if result != nil && result.ErrorMessage != "" {
+			errMsg = result.ErrorMessage
+		}
+		return types.ADCValidationServerAddrError{
+			ServerAddr: serverAddr,
+			Err:        errMsg,
+			ValidationErrors: func() []types.ADCValidationDetail {
+				if result == nil {
+					return nil
+				}
+				return result.Errors
+			}(),
+		}
+	}
+
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	if result := parseValidationResult(); result != nil && result.Success != nil && !*result.Success {
+		errMsg := result.ErrorMessage
+		if errMsg == "" {
+			errMsg = "ADC validation failed"
+		}
+		return types.ADCValidationServerAddrError{
+			ServerAddr:       serverAddr,
+			Err:              errMsg,
+			ValidationErrors: result.Errors,
+		}
+	}
+
+	return nil
+}

@@ -1,0 +1,326 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package cache
+
+import (
+	"errors"
+
+	"github.com/hashicorp/go-memdb"
+
+	types "github.com/apache/apisix-ingress-controller/api/adc"
+)
+
+var (
+	// ErrStillInUse means an object is still in use.
+	ErrStillInUse = errors.New("still in use")
+	// ErrNotFound is returned when the requested item is not found.
+	ErrNotFound = memdb.ErrNotFound
+)
+
+type dbCache struct {
+	db *memdb.MemDB
+}
+
+// NewMemDBCache creates a Cache object backs with a memory DB.
+func NewMemDBCache() (Cache, error) {
+	db, err := memdb.NewMemDB(_schema)
+	if err != nil {
+		return nil, err
+	}
+	return &dbCache{
+		db: db,
+	}, nil
+}
+
+func (c *dbCache) Insert(obj any) error {
+	switch t := obj.(type) {
+	case *types.SSL:
+		return c.InsertSSL(t)
+	case *types.Service:
+		return c.InsertService(t)
+	case *types.Consumer:
+		return c.InsertConsumer(t)
+	case *GlobalRuleRow:
+		return c.InsertGlobalRule(t)
+	case *PluginMetadataRow:
+		return c.InsertPluginMetadata(t)
+	default:
+		return errors.New("unsupported type")
+	}
+
+}
+func (c *dbCache) Delete(obj any) error {
+	switch t := obj.(type) {
+	case *types.Route:
+		return c.DeleteRoute(t)
+	case *types.SSL:
+		return c.DeleteSSL(t)
+	case *types.Service:
+		return c.DeleteService(t)
+	case *types.Consumer:
+		return c.DeleteConsumer(t)
+	case *GlobalRuleRow:
+		return c.DeleteGlobalRule(t)
+	case *PluginMetadataRow:
+		return c.DeletePluginMetadata(t)
+	default:
+		return errors.New("unsupported type")
+	}
+}
+
+func (c *dbCache) InsertRoute(r *types.Route) error {
+	route := r.DeepCopy()
+	return c.insert(types.TypeRoute, route)
+}
+
+func (c *dbCache) InsertSSL(ssl *types.SSL) error {
+	return c.insert(types.TypeSSL, ssl.DeepCopy())
+}
+
+func (c *dbCache) InsertService(u *types.Service) error {
+	return c.insert(types.TypeService, u.DeepCopy())
+}
+
+func (c *dbCache) InsertConsumer(consumer *types.Consumer) error {
+	return c.insert(types.TypeConsumer, consumer.DeepCopy())
+}
+
+func (c *dbCache) InsertGlobalRule(globalRule *GlobalRuleRow) error {
+	return c.insert(types.TypeGlobalRule, globalRule.DeepCopy())
+}
+
+func (c *dbCache) InsertPluginMetadata(pluginMetadata *PluginMetadataRow) error {
+	return c.insert(types.TypePluginMetadata, pluginMetadata.DeepCopy())
+}
+
+func (c *dbCache) insert(table string, obj any) error {
+	txn := c.db.Txn(true)
+	defer txn.Abort()
+	if err := txn.Insert(table, obj); err != nil {
+		return err
+	}
+	txn.Commit()
+	return nil
+}
+
+func (c *dbCache) GetRoute(id string) (*types.Route, error) {
+	obj, err := c.get(types.TypeRoute, id)
+	if err != nil {
+		return nil, err
+	}
+	return obj.(*types.Route).DeepCopy(), nil
+}
+
+func (c *dbCache) GetSSL(id string) (*types.SSL, error) {
+	obj, err := c.get(types.TypeSSL, id)
+	if err != nil {
+		return nil, err
+	}
+	return obj.(*types.SSL).DeepCopy(), nil
+}
+
+func (c *dbCache) GetService(id string) (*types.Service, error) {
+	obj, err := c.get(types.TypeService, id)
+	if err != nil {
+		return nil, err
+	}
+	return obj.(*types.Service).DeepCopy(), nil
+}
+
+func (c *dbCache) GetConsumer(username string) (*types.Consumer, error) {
+	obj, err := c.get(types.TypeConsumer, username)
+	if err != nil {
+		return nil, err
+	}
+	return obj.(*types.Consumer).DeepCopy(), nil
+}
+
+func (c *dbCache) GetGlobalRule(id string) (*GlobalRuleRow, error) {
+	obj, err := c.get(types.TypeGlobalRule, id)
+	if err != nil {
+		return nil, err
+	}
+	return obj.(*GlobalRuleRow).DeepCopy(), nil
+}
+
+func (c *dbCache) GetPluginMetadata(id string) (*PluginMetadataRow, error) {
+	obj, err := c.get(types.TypePluginMetadata, id)
+	if err != nil {
+		return nil, err
+	}
+	return obj.(*PluginMetadataRow).DeepCopy(), nil
+}
+
+func (c *dbCache) GetStreamRoute(id string) (*types.StreamRoute, error) {
+	obj, err := c.get("stream_route", id)
+	if err != nil {
+		return nil, err
+	}
+	return obj.(*types.StreamRoute).DeepCopy(), nil
+}
+
+func (c *dbCache) get(table, id string) (any, error) {
+	txn := c.db.Txn(false)
+	defer txn.Abort()
+	obj, err := txn.First(table, "id", id)
+	if err != nil {
+		if err == memdb.ErrNotFound {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if obj == nil {
+		return nil, ErrNotFound
+	}
+	return obj, nil
+}
+
+func (c *dbCache) ListRoutes(opts ...ListOption) ([]*types.Route, error) {
+	raws, err := c.list(types.TypeRoute, opts...)
+	if err != nil {
+		return nil, err
+	}
+	routes := make([]*types.Route, 0, len(raws))
+	for _, raw := range raws {
+		routes = append(routes, raw.(*types.Route).DeepCopy())
+	}
+	return routes, nil
+}
+
+func (c *dbCache) ListSSL(opts ...ListOption) ([]*types.SSL, error) {
+	raws, err := c.list(types.TypeSSL, opts...)
+	if err != nil {
+		return nil, err
+	}
+	ssl := make([]*types.SSL, 0, len(raws))
+	for _, raw := range raws {
+		ssl = append(ssl, raw.(*types.SSL).DeepCopy())
+	}
+	return ssl, nil
+}
+
+func (c *dbCache) ListServices(opts ...ListOption) ([]*types.Service, error) {
+	raws, err := c.list(types.TypeService, opts...)
+	if err != nil {
+		return nil, err
+	}
+	services := make([]*types.Service, 0, len(raws))
+	for _, raw := range raws {
+		services = append(services, raw.(*types.Service).DeepCopy())
+	}
+	return services, nil
+}
+
+func (c *dbCache) ListConsumers(opts ...ListOption) ([]*types.Consumer, error) {
+	raws, err := c.list(types.TypeConsumer, opts...)
+	if err != nil {
+		return nil, err
+	}
+	consumers := make([]*types.Consumer, 0, len(raws))
+	for _, raw := range raws {
+		consumers = append(consumers, raw.(*types.Consumer).DeepCopy())
+	}
+	return consumers, nil
+}
+
+func (c *dbCache) ListGlobalRules(opts ...ListOption) ([]*GlobalRuleRow, error) {
+	raws, err := c.list(types.TypeGlobalRule, opts...)
+	if err != nil {
+		return nil, err
+	}
+	globalRules := make([]*GlobalRuleRow, 0, len(raws))
+	for _, raw := range raws {
+		globalRules = append(globalRules, raw.(*GlobalRuleRow).DeepCopy())
+	}
+	return globalRules, nil
+}
+
+func (c *dbCache) ListPluginMetadata(opts ...ListOption) ([]*PluginMetadataRow, error) {
+	raws, err := c.list(types.TypePluginMetadata, opts...)
+	if err != nil {
+		return nil, err
+	}
+	pluginMetadata := make([]*PluginMetadataRow, 0, len(raws))
+	for _, raw := range raws {
+		pluginMetadata = append(pluginMetadata, raw.(*PluginMetadataRow).DeepCopy())
+	}
+	return pluginMetadata, nil
+}
+
+func (c *dbCache) list(table string, opts ...ListOption) ([]any, error) {
+	txn := c.db.Txn(false)
+	defer txn.Abort()
+	listOpts := &ListOptions{}
+	listOpts.ApplyOptions(opts)
+	index := "id"
+	var args []any
+	if listOpts.KindLabelSelector != nil {
+		index = KindLabelIndex
+		args = []any{listOpts.KindLabelSelector.Kind, listOpts.KindLabelSelector.Namespace, listOpts.KindLabelSelector.Name}
+	}
+	if listOpts.OwnerSelector != nil {
+		index = OwnerIndex
+		args = []any{listOpts.OwnerSelector.Owner}
+	}
+	iter, err := txn.Get(table, index, args...)
+	if err != nil {
+		return nil, err
+	}
+	var objs []any
+	for obj := iter.Next(); obj != nil; obj = iter.Next() {
+		objs = append(objs, obj)
+	}
+	return objs, nil
+}
+
+func (c *dbCache) DeleteRoute(r *types.Route) error {
+	return c.delete(types.TypeRoute, r)
+}
+
+func (c *dbCache) DeleteSSL(ssl *types.SSL) error {
+	return c.delete(types.TypeSSL, ssl)
+}
+
+func (c *dbCache) DeleteService(u *types.Service) error {
+	return c.delete(types.TypeService, u)
+}
+
+func (c *dbCache) DeleteConsumer(consumer *types.Consumer) error {
+	return c.delete(types.TypeConsumer, consumer)
+}
+
+func (c *dbCache) DeleteGlobalRule(globalRule *GlobalRuleRow) error {
+	return c.delete(types.TypeGlobalRule, globalRule)
+}
+
+func (c *dbCache) DeletePluginMetadata(pluginMetadata *PluginMetadataRow) error {
+	return c.delete(types.TypePluginMetadata, pluginMetadata)
+}
+
+func (c *dbCache) delete(table string, obj any) error {
+	txn := c.db.Txn(true)
+	defer txn.Abort()
+	if err := txn.Delete(table, obj); err != nil {
+		if err == memdb.ErrNotFound {
+			return ErrNotFound
+		}
+		return err
+	}
+	txn.Commit()
+	return nil
+}

@@ -1,0 +1,961 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package v2
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"os"
+	"os/exec"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/types"
+
+	adctypes "github.com/apache/apisix-ingress-controller/api/adc"
+	apiv2 "github.com/apache/apisix-ingress-controller/api/v2"
+	"github.com/apache/apisix-ingress-controller/test/e2e/framework"
+	"github.com/apache/apisix-ingress-controller/test/e2e/scaffold"
+)
+
+type Headers map[string]string
+
+func generateHMACHeaders(keyID, secretKey, method, path string) map[string]string {
+	gmtTime := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+	signingString := fmt.Sprintf("%s\n%s %s\ndate: %s\n", keyID, method, path, gmtTime)
+
+	// Create HMAC signature
+	mac := hmac.New(sha256.New, []byte(secretKey))
+	mac.Write([]byte(signingString))
+	signature := mac.Sum(nil)
+	signatureBase64 := base64.StdEncoding.EncodeToString(signature)
+
+	// Construct Authorization header
+	authHeader := fmt.Sprintf(
+		`Signature keyId="%s",algorithm="hmac-sha256",headers="@request-target date",signature="%s"`,
+		keyID, signatureBase64,
+	)
+
+	return map[string]string{
+		"Date":          gmtTime,
+		"Authorization": authHeader,
+	}
+}
+
+var _ = Describe("Test ApisixConsumer", Label("apisix.apache.org", "v2", "apisixconsumer"), func() {
+	var (
+		s       = scaffold.NewDefaultScaffold()
+		applier = framework.NewApplier(s.GinkgoT, s.K8sClient, s.CreateResourceFromString)
+	)
+
+	BeforeEach(func() {
+		By("create GatewayProxy")
+		err := s.CreateResourceFromString(s.GetGatewayProxySpec())
+		Expect(err).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+		By("create IngressClass")
+		err = s.CreateResourceFromStringWithNamespace(s.GetIngressClassYaml(), "")
+		Expect(err).NotTo(HaveOccurred(), "creating IngressClass")
+	})
+
+	Context("Test KeyAuth", func() {
+		const (
+			keyAuth = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: test-consumer
+spec:
+  ingressClassName: %s
+  authParameter:
+    keyAuth:
+      value:
+        key: test-key
+`
+			defaultApisixRoute = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: default
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      hosts:
+      - httpbin
+      paths:
+      - /get
+      - /headers
+      - /anything
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    authentication:
+      enable: true
+      type: keyAuth
+`
+			secret = `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keyauth
+data:
+  # foo-key
+  key: Zm9vLWtleQ==
+`
+			secretUpdated = `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keyauth
+data:
+  # foo2-key
+  key: Zm9vMi1rZXk=
+`
+			keyAuthWiwhSecret = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: test-consumer
+spec:
+  ingressClassName: %s
+  authParameter:
+    keyAuth:
+      secretRef:
+        name: keyauth
+`
+			foreignIngressClass = `
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: %s
+spec:
+  controller: example.com/other-ingress-controller
+`
+			managedIngressClass = `
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: %s
+spec:
+  controller: %s
+  parameters:
+    apiGroup: apisix.apache.org
+    kind: GatewayProxy
+    name: apisix-proxy-config
+    namespace: %s
+    scope: Namespace
+`
+		)
+		request := func(path string, headers Headers) int {
+			return s.NewAPISIXClient().GET(path).WithHeaders(headers).WithHost("httpbin").Expect().Raw().StatusCode
+		}
+		applyKeyAuthResources := func(consumerIngressClass string) {
+			By("apply ApisixRoute")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "default"},
+				&apiv2.ApisixRoute{}, fmt.Sprintf(defaultApisixRoute, s.Namespace()))
+
+			By("apply ApisixConsumer")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-consumer"},
+				&apiv2.ApisixConsumer{}, fmt.Sprintf(keyAuth, consumerIngressClass))
+
+			By("verify the consumer key")
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "test-key",
+			}).WithTimeout(30 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusOK))
+		}
+		consumerExists := func() (bool, error) {
+			consumers, err := s.DefaultDataplaneResource().Consumer().List(context.Background())
+			if err != nil {
+				return false, err
+			}
+			username := adctypes.ComposeConsumerName(s.Namespace(), "test-consumer")
+			for _, consumer := range consumers {
+				if consumer.Username == username {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+		expectKeyRejected := func() {
+			By("verify the consumer key is no longer accepted")
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "test-key",
+			}).WithTimeout(30 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusUnauthorized))
+		}
+		expectConsumerAbsent := func() {
+			By("verify the consumer is removed from APISIX")
+			Eventually(consumerExists).WithTimeout(30 * time.Second).ProbeEvery(time.Second).Should(BeFalse())
+		}
+
+		It("Basic tests", func() {
+			By("apply ApisixRoute")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "default"}, &apiv2.ApisixRoute{}, fmt.Sprintf(defaultApisixRoute, s.Namespace()))
+
+			By("apply ApisixConsumer")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-consumer"}, &apiv2.ApisixConsumer{}, fmt.Sprintf(keyAuth, s.Namespace()))
+
+			By("verify ApisixRoute with ApisixConsumer")
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "invalid-key",
+			}).WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusUnauthorized))
+
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "test-key",
+			}).WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusOK))
+
+			By("Delete ApisixConsumer")
+			err := s.DeleteResource("ApisixConsumer", "test-consumer")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixConsumer")
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "test-key",
+			}).WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusUnauthorized))
+
+			By("delete ApisixRoute")
+			err = s.DeleteResource("ApisixRoute", "default")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+			Eventually(request).WithArguments("/headers", Headers{}).WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusNotFound))
+		})
+
+		It("SecretRef tests", func() {
+			By("apply ApisixRoute")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "default"}, &apiv2.ApisixRoute{},
+				fmt.Sprintf(defaultApisixRoute, s.Namespace()))
+
+			By("apply Secret")
+			err := s.CreateResourceFromString(secret)
+			Expect(err).ShouldNot(HaveOccurred(), "creating Secret for ApisixConsumer")
+
+			By("apply ApisixConsumer")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-consumer"}, &apiv2.ApisixConsumer{},
+				fmt.Sprintf(keyAuthWiwhSecret, s.Namespace()))
+
+			By("verify ApisixRoute with ApisixConsumer")
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "invalid-key",
+			}).WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusUnauthorized))
+
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "foo-key",
+			}).WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusOK))
+
+			By("update Secret")
+			err = s.CreateResourceFromString(secretUpdated)
+			Expect(err).ShouldNot(HaveOccurred(), "updating Secret for ApisixConsumer")
+
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "foo-key",
+			}).WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusUnauthorized))
+
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "foo2-key",
+			}).WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusOK))
+
+			By("Delete ApisixConsumer")
+			err = s.DeleteResource("ApisixConsumer", "test-consumer")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixConsumer")
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "test-key",
+			}).WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusUnauthorized))
+
+			By("delete ApisixRoute")
+			err = s.DeleteResource("ApisixRoute", "default")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+			Eventually(request).WithArguments("/headers", Headers{}).WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusNotFound))
+		})
+
+		It("removes the consumer after an IngressClass handoff", func() {
+			applyKeyAuthResources(s.Namespace())
+
+			foreignClassName := s.Namespace() + "-other"
+			By("create another controller's IngressClass")
+			err := s.CreateResourceFromStringWithNamespace(fmt.Sprintf(foreignIngressClass, foreignClassName), "")
+			Expect(err).NotTo(HaveOccurred(), "creating IngressClass")
+
+			By("change only the consumer IngressClassName")
+			var consumer apiv2.ApisixConsumer
+			err = s.K8sClient.Get(context.Background(),
+				types.NamespacedName{Namespace: s.Namespace(), Name: "test-consumer"}, &consumer)
+			Expect(err).NotTo(HaveOccurred(), "getting ApisixConsumer")
+			consumer.Spec.IngressClassName = foreignClassName
+			err = s.K8sClient.Update(context.Background(), &consumer)
+			Expect(err).NotTo(HaveOccurred(), "updating ApisixConsumer")
+
+			expectKeyRejected()
+			expectConsumerAbsent()
+		})
+
+		It("removes the consumer after its IngressClass is deleted", func() {
+			consumerClassName := s.Namespace() + "-consumer"
+			By("create a dedicated IngressClass for the consumer")
+			err := s.CreateResourceFromStringWithNamespace(fmt.Sprintf(
+				managedIngressClass, consumerClassName, s.GetControllerName(), s.Namespace(),
+			), "")
+			Expect(err).NotTo(HaveOccurred(), "creating IngressClass")
+
+			applyKeyAuthResources(consumerClassName)
+
+			By("delete the consumer IngressClass")
+			err = s.DeleteResource("IngressClass", consumerClassName)
+			Expect(err).NotTo(HaveOccurred(), "deleting IngressClass")
+
+			By("verify the consumer key is no longer accepted")
+			Eventually(request).WithArguments("/get", Headers{
+				"apikey": "test-key",
+			}).WithTimeout(30 * time.Second).ProbeEvery(time.Second).ShouldNot(Equal(http.StatusOK))
+			expectConsumerAbsent()
+		})
+	})
+
+	Context("Test BasicAuth", func() {
+		const (
+			basicAuth = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: test-consumer
+spec:
+  ingressClassName: %s
+  authParameter:
+    basicAuth:
+      value:
+        username: test-user
+        password: test-password
+`
+			defaultApisixRoute = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: default
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      hosts:
+      - httpbin
+      paths:
+      - /get
+      - /headers
+      - /anything
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    authentication:
+      enable: true
+      type: basicAuth
+`
+
+			secret = `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: basic
+data:
+  # foo:bar
+  username: Zm9v
+  password: YmFy
+`
+			secretUpdated = `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: basic
+data:
+  # foo-new-user:bar-new-password
+  username: Zm9vLW5ldy11c2Vy
+  password: YmFyLW5ldy1wYXNzd29yZA==
+`
+
+			basicAuthWithSecret = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: test-consumer
+spec:
+  ingressClassName: %s
+  authParameter:
+    basicAuth:
+      secretRef:
+        name: basic
+`
+		)
+
+		It("Basic tests", func() {
+			By("apply ApisixRoute")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "default"}, &apiv2.ApisixRoute{}, fmt.Sprintf(defaultApisixRoute, s.Namespace()))
+
+			By("apply ApisixConsumer")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-consumer"}, &apiv2.ApisixConsumer{}, fmt.Sprintf(basicAuth, s.Namespace()))
+
+			By("verify ApisixRoute with ApisixConsumer")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Host:   "httpbin",
+				BasicAuth: &scaffold.BasicAuth{
+					Username: "invalid-username",
+					Password: "invalid-password",
+				},
+				Check: scaffold.WithExpectedStatus(http.StatusUnauthorized),
+			})
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Host:   "httpbin",
+				BasicAuth: &scaffold.BasicAuth{
+					Username: "test-user",
+					Password: "test-password",
+				},
+				Check: scaffold.WithExpectedStatus(http.StatusOK),
+			})
+
+			By("Delete ApisixConsumer")
+			err := s.DeleteResource("ApisixConsumer", "test-consumer")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixConsumer")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Host:   "httpbin",
+				BasicAuth: &scaffold.BasicAuth{
+					Username: "test-user",
+					Password: "test-password",
+				},
+				Check: scaffold.WithExpectedStatus(http.StatusUnauthorized),
+			})
+
+			By("delete ApisixRoute")
+			err = s.DeleteResource("ApisixRoute", "default")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Host:   "httpbin",
+				Check:  scaffold.WithExpectedStatus(http.StatusNotFound),
+			})
+		})
+
+		It("SecretRef tests", func() {
+			By("apply ApisixRoute")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "default"}, &apiv2.ApisixRoute{},
+				fmt.Sprintf(defaultApisixRoute, s.Namespace()))
+
+			By("apply Secret")
+			err := s.CreateResourceFromString(secret)
+			Expect(err).ShouldNot(HaveOccurred(), "creating Secret for ApisixConsumer")
+
+			By("apply ApisixConsumer")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-consumer"},
+				&apiv2.ApisixConsumer{}, fmt.Sprintf(basicAuthWithSecret, s.Namespace()))
+
+			By("verify ApisixRoute with ApisixConsumer")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Host:   "httpbin",
+				Check:  scaffold.WithExpectedStatus(http.StatusUnauthorized),
+			})
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Host:   "httpbin",
+				BasicAuth: &scaffold.BasicAuth{
+					Username: "foo",
+					Password: "bar",
+				},
+				Check: scaffold.WithExpectedStatus(http.StatusOK),
+			})
+
+			By("update Secret")
+			err = s.CreateResourceFromString(secretUpdated)
+			Expect(err).ShouldNot(HaveOccurred(), "updating Secret for ApisixConsumer")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Host:   "httpbin",
+				BasicAuth: &scaffold.BasicAuth{
+					Username: "foo",
+					Password: "bar",
+				},
+				Check: scaffold.WithExpectedStatus(http.StatusUnauthorized),
+			})
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Host:   "httpbin",
+				BasicAuth: &scaffold.BasicAuth{
+					Username: "foo-new-user",
+					Password: "bar-new-password",
+				},
+				Check: scaffold.WithExpectedStatus(http.StatusOK),
+			})
+
+			By("Delete ApisixConsumer")
+			err = s.DeleteResource("ApisixConsumer", "test-consumer")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixConsumer")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Host:   "httpbin",
+				BasicAuth: &scaffold.BasicAuth{
+					Username: "foo-new-user",
+					Password: "bar-new-password",
+				},
+				Check: scaffold.WithExpectedStatus(http.StatusUnauthorized),
+			})
+
+			By("delete ApisixRoute")
+			err = s.DeleteResource("ApisixRoute", "default")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Host:   "httpbin",
+				Check:  scaffold.WithExpectedStatus(http.StatusNotFound),
+			})
+		})
+	})
+
+	Context("Test HMACAuth", func() {
+		const (
+			hmacAuthConsumer = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: hmac-consumer
+spec:
+  ingressClassName: %s
+  authParameter:
+    hmacAuth:
+      value:
+        key_id: papa
+        secret_key: fatpa
+`
+
+			hmacAuthConsumerInvalid = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: hmac-consumer
+spec:
+  ingressClassName: %s
+  authParameter:
+    hmacAuth:
+      value:
+        secret_key: fatpa
+`
+			hmacRoute = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: hmac-route
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule1
+    match:
+      hosts:
+      - httpbin.org
+      paths:
+        - /ip
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    authentication:
+      enable: true
+      type: hmacAuth
+`
+			hmacSecret = `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hmac
+data:
+  key_id: cGFwYQ==
+  secret_key: ZmF0cGE=
+`
+			hmacAuthWithSecret = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: hmac-consumer
+spec:
+  ingressClassName: %s
+  authParameter:
+    hmacAuth:
+      secretRef:
+        name: hmac
+`
+		)
+
+		It("Basic tests", func() {
+			By("apply ApisixRoute")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "hmac-route"},
+				&apiv2.ApisixRoute{}, fmt.Sprintf(hmacRoute, s.Namespace()))
+
+			By("apply Invalid ApisixConsumer with missing required field")
+			err := s.CreateResourceFromString(hmacAuthConsumerInvalid)
+			Expect(err).Should(HaveOccurred(), "creating invalid ApisixConsumer")
+
+			By("apply ApisixConsumer")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "hmac-consumer"},
+				&apiv2.ApisixConsumer{}, fmt.Sprintf(hmacAuthConsumer, s.Namespace()))
+
+			By("verify ApisixRoute with ApisixConsumer")
+			// Generate HMAC headers dynamically
+			hmacHeaders := generateHMACHeaders("papa", "fatpa", "GET", "/ip")
+
+			// Test valid HMAC authentication
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method:  "GET",
+				Path:    "/ip",
+				Host:    "httpbin.org",
+				Headers: hmacHeaders,
+				Check:   scaffold.WithExpectedStatus(http.StatusOK),
+			})
+
+			// Test missing authorization
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/ip",
+				Host:   "httpbin.org",
+				Check:  scaffold.WithExpectedStatus(http.StatusUnauthorized),
+			})
+
+			By("Delete resources")
+			err = s.DeleteResource("ApisixConsumer", "hmac-consumer")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixConsumer")
+
+			err = s.DeleteResource("ApisixRoute", "hmac-route")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+		})
+
+		It("SecretRef tests", func() {
+			By("apply ApisixRoute")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "hmac-route"},
+				&apiv2.ApisixRoute{}, fmt.Sprintf(hmacRoute, s.Namespace()))
+
+			By("apply Secret")
+			err := s.CreateResourceFromString(hmacSecret)
+			Expect(err).ShouldNot(HaveOccurred(), "creating Secret for ApisixConsumer")
+
+			By("apply ApisixConsumer")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "hmac-consumer"},
+				&apiv2.ApisixConsumer{}, fmt.Sprintf(hmacAuthWithSecret, s.Namespace()))
+
+			By("verify ApisixRoute with ApisixConsumer")
+			// Generate HMAC headers dynamically
+			hmacHeaders := generateHMACHeaders("papa", "fatpa", "GET", "/ip")
+
+			// Test valid HMAC authentication
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method:  "GET",
+				Path:    "/ip",
+				Host:    "httpbin.org",
+				Headers: hmacHeaders,
+				Check:   scaffold.WithExpectedStatus(http.StatusOK),
+			})
+
+			By("Delete resources")
+			err = s.DeleteResource("ApisixConsumer", "hmac-consumer")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixConsumer")
+
+			err = s.DeleteResource("ApisixRoute", "hmac-route")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+
+			err = s.DeleteResource("Secret", "hmac")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting Secret")
+		})
+	})
+	Context("Test LDAPAuth", func() {
+		getLDAPServerURL := func() (string, error) {
+			wd, _ := os.Getwd()
+			cmd := exec.Command("sh", "../testdata/ldap/cmd.sh", "ip")
+			ip, err := cmd.Output()
+			errr := fmt.Sprintf("cd %s/testdata/ldap && sh cmd.sh ip failed", wd)
+			if err != nil {
+				return "", fmt.Errorf(errr+" : %v", err)
+			}
+			if len(ip) == 0 {
+				return "", fmt.Errorf("ldap-server start failed")
+			}
+			return fmt.Sprintf("%s:1389", string(ip)), nil
+		}
+		request := func(path string, username, password string) int {
+			return s.NewAPISIXClient().GET(path).WithBasicAuth(username, password).WithHost("httpbin").Expect().Raw().StatusCode
+		}
+		It("ApisixRoute with ldapAuth consumer using secret", func() {
+			secret := `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ldap
+data:
+  user_dn: Y249amFjayxvdT11c2VycyxkYz1sZGFwLGRjPWV4YW1wbGUsZGM9b3Jn
+`
+			assert.Nil(GinkgoT(), s.CreateResourceFromString(secret), "creating ldapAuth secret for ApisixConsumer")
+
+			ac := `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: jack
+spec:
+  ingressClassName: %s
+  authParameter:
+    ldapAuth:
+      secretRef:
+        name: ldap
+`
+
+			By("apply ApisixConsumer")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "jack"},
+				&apiv2.ApisixConsumer{}, fmt.Sprintf(ac, s.Namespace()))
+
+			ldapSvr, err := getLDAPServerURL()
+			assert.Nil(GinkgoT(), err, "check ldap server")
+			ar := fmt.Sprintf(`
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+ name: httpbin-route
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule1
+    match:
+      hosts:
+      - httpbin
+      paths:
+        - /get
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    authentication:
+      enable: true
+      type: ldapAuth
+      ldapAuth: 
+        ldap_uri: %s
+        base_dn: "ou=users,dc=ldap,dc=example,dc=org"
+        use_tls: false
+        uid: "cn"
+`, s.Namespace(), ldapSvr)
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "httpbin-route"},
+				&apiv2.ApisixRoute{}, ar)
+
+			By("verify ApisixRoute with ApisixConsumer")
+			Eventually(request).WithArguments("/get", "", "").WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusUnauthorized))
+
+			By("verify ApisixRoute with ApisixConsumer")
+			Eventually(request).WithArguments("/get", "jack", "jackPassword").WithTimeout(5 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusOK))
+		})
+	})
+
+	Context("Test Consumer Plugins - authParameter with extra plugins", func() {
+		// Verify that a consumer with authParameter + plugins (e.g. limit-count) works:
+		// auth is enforced via authParameter and limit-count throttles authenticated traffic.
+		const (
+			consumerWithPlugins = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: consumer-with-plugins
+spec:
+  ingressClassName: %s
+  authParameter:
+    keyAuth:
+      value:
+        key: plugin-test-key
+  plugins:
+  - name: limit-count
+    enable: true
+    config:
+      count: 2
+      time_window: 60
+      rejected_code: 429
+      key: consumer_name
+      policy: local
+`
+			pluginRoute = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: plugin-route
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      hosts:
+      - httpbin
+      paths:
+      - /get
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    authentication:
+      enable: true
+      type: keyAuth
+`
+		)
+
+		It("consumer-level limit-count plugin is enforced", func() {
+			By("apply ApisixRoute")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "plugin-route"},
+				&apiv2.ApisixRoute{}, fmt.Sprintf(pluginRoute, s.Namespace()))
+
+			By("apply ApisixConsumer with plugins")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "consumer-with-plugins"},
+				&apiv2.ApisixConsumer{}, fmt.Sprintf(consumerWithPlugins, s.Namespace()))
+
+			By("unauthenticated request is rejected")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method:  "GET",
+				Path:    "/get",
+				Host:    "httpbin",
+				Headers: map[string]string{"apikey": "wrong-key"},
+				Check:   scaffold.WithExpectedStatus(http.StatusUnauthorized),
+			})
+
+			By("first authenticated request succeeds")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method:  "GET",
+				Path:    "/get",
+				Host:    "httpbin",
+				Headers: map[string]string{"apikey": "plugin-test-key"},
+				Check:   scaffold.WithExpectedStatus(http.StatusOK),
+			})
+
+			By("second authenticated request succeeds")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method:  "GET",
+				Path:    "/get",
+				Host:    "httpbin",
+				Headers: map[string]string{"apikey": "plugin-test-key"},
+				Check:   scaffold.WithExpectedStatus(http.StatusOK),
+			})
+
+			By("third request is rate-limited by consumer-level limit-count")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method:  "GET",
+				Path:    "/get",
+				Host:    "httpbin",
+				Headers: map[string]string{"apikey": "plugin-test-key"},
+				Check:   scaffold.WithExpectedStatus(http.StatusTooManyRequests),
+			})
+
+			By("delete ApisixConsumer")
+			err := s.DeleteResource("ApisixConsumer", "consumer-with-plugins")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixConsumer")
+
+			By("delete ApisixRoute")
+			err = s.DeleteResource("ApisixRoute", "plugin-route")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+		})
+	})
+
+	Context("Test Consumer Plugins - plugins only (no authParameter)", func() {
+		// Verify that authParameter can be omitted entirely and auth can be
+		// configured directly via the plugins field.
+		const (
+			consumerPluginsOnly = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: consumer-plugins-only
+spec:
+  ingressClassName: %s
+  plugins:
+  - name: key-auth
+    enable: true
+    config:
+      key: plugins-only-key
+`
+			pluginsOnlyRoute = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: plugins-only-route
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      hosts:
+      - httpbin
+      paths:
+      - /get
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    authentication:
+      enable: true
+      type: keyAuth
+`
+		)
+
+		It("auth plugin configured via plugins field only", func() {
+			By("apply ApisixRoute")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "plugins-only-route"},
+				&apiv2.ApisixRoute{}, fmt.Sprintf(pluginsOnlyRoute, s.Namespace()))
+
+			By("apply ApisixConsumer with plugins only (no authParameter)")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "consumer-plugins-only"},
+				&apiv2.ApisixConsumer{}, fmt.Sprintf(consumerPluginsOnly, s.Namespace()))
+
+			By("request with wrong key is rejected")
+			Eventually(func() int {
+				return s.NewAPISIXClient().GET("/get").
+					WithHeader("apikey", "wrong-key").
+					WithHost("httpbin").
+					Expect().Raw().StatusCode
+			}).WithTimeout(10 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusUnauthorized))
+
+			By("request with correct key succeeds")
+			Eventually(func() int {
+				return s.NewAPISIXClient().GET("/get").
+					WithHeader("apikey", "plugins-only-key").
+					WithHost("httpbin").
+					Expect().Raw().StatusCode
+			}).WithTimeout(10 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusOK))
+
+			By("delete ApisixConsumer")
+			err := s.DeleteResource("ApisixConsumer", "consumer-plugins-only")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixConsumer")
+
+			By("request with correct key is rejected after consumer deletion")
+			Eventually(func() int {
+				return s.NewAPISIXClient().GET("/get").
+					WithHeader("apikey", "plugins-only-key").
+					WithHost("httpbin").
+					Expect().Raw().StatusCode
+			}).WithTimeout(10 * time.Second).ProbeEvery(time.Second).Should(Equal(http.StatusUnauthorized))
+
+			By("delete ApisixRoute")
+			err = s.DeleteResource("ApisixRoute", "plugins-only-route")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+		})
+	})
+})

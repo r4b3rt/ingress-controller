@@ -1,0 +1,265 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package translator
+
+import (
+	"fmt"
+
+	"k8s.io/utils/ptr"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	adctypes "github.com/apache/apisix-ingress-controller/api/adc"
+	apiv2 "github.com/apache/apisix-ingress-controller/api/v2"
+	"github.com/apache/apisix-ingress-controller/internal/controller/label"
+	cutils "github.com/apache/apisix-ingress-controller/internal/controller/utils"
+	"github.com/apache/apisix-ingress-controller/internal/id"
+	"github.com/apache/apisix-ingress-controller/internal/provider"
+	"github.com/apache/apisix-ingress-controller/internal/types"
+)
+
+func (t *Translator) TranslateTLSRoute(tctx *provider.TranslateContext, tlsRoute *gatewayv1.TLSRoute) (*TranslateResult, error) {
+	result := &TranslateResult{}
+	rules := tlsRoute.Spec.Rules
+	labels := label.GenLabel(tlsRoute)
+	for ruleIndex, rule := range rules {
+		service := adctypes.NewDefaultService()
+		service.Labels = labels
+		service.Name = adctypes.ComposeServiceNameWithStream(tlsRoute.Namespace, tlsRoute.Name, fmt.Sprintf("%d", ruleIndex), "TLS")
+		service.ID = id.GenID(service.Name)
+		var (
+			upstreams         = make([]*adctypes.Upstream, 0)
+			weightedUpstreams = make([]adctypes.TrafficSplitConfigRuleWeightedUpstream, 0)
+		)
+		for _, backend := range rule.BackendRefs {
+			if backend.Namespace == nil {
+				namespace := gatewayv1.Namespace(tlsRoute.Namespace)
+				backend.Namespace = &namespace
+			}
+			upstream := newDefaultUpstreamWithoutScheme()
+			upNodes, _, err := t.translateBackendRef(tctx, backend, DefaultEndpointFilter)
+			if err != nil {
+				continue
+			}
+			if len(upNodes) == 0 {
+				continue
+			}
+			// TODO: Confirm BackendTrafficPolicy attachment with e2e test case.
+			t.AttachBackendTrafficPolicyToUpstream(backend, tctx.BackendTrafficPolicies, upstream, tctx.Services)
+			upstream.Nodes = upNodes
+			var (
+				kind string
+				port int32
+			)
+			if backend.Kind == nil {
+				kind = types.KindService
+			} else {
+				kind = string(*backend.Kind)
+			}
+			if backend.Port != nil {
+				port = *backend.Port
+			}
+			namespace := string(*backend.Namespace)
+			name := string(backend.Name)
+			upstreamName := adctypes.ComposeUpstreamNameForBackendRef(kind, namespace, name, port)
+			upstream.Name = upstreamName
+			upstream.ID = id.GenID(upstreamName)
+			upstreams = append(upstreams, upstream)
+		}
+
+		// Handle multiple backends with traffic-split plugin
+		if len(upstreams) == 0 {
+			// Create a default upstream if no valid backends
+			upstream := adctypes.NewDefaultUpstream()
+			service.Upstream = upstream
+		} else if len(upstreams) == 1 {
+			// Single backend - use directly as service upstream
+			service.Upstream = upstreams[0]
+			// remove the id and name of the service.upstream, adc schema does not need id and name for it
+			service.Upstream.ID = ""
+			service.Upstream.Name = ""
+		} else {
+			// Multiple backends - use traffic-split plugin
+			service.Upstream = upstreams[0]
+			// remove the id and name of the service.upstream, adc schema does not need id and name for it
+			service.Upstream.ID = ""
+			service.Upstream.Name = ""
+
+			upstreams = upstreams[1:]
+
+			if len(upstreams) > 0 {
+				service.Upstreams = upstreams
+			}
+
+			// Set weight in traffic-split for the default upstream
+			weight := apiv2.DefaultWeight
+			if rule.BackendRefs[0].Weight != nil {
+				weight = int(*rule.BackendRefs[0].Weight)
+			}
+			weightedUpstreams = append(weightedUpstreams, adctypes.TrafficSplitConfigRuleWeightedUpstream{
+				Weight: weight,
+			})
+
+			// Set other upstreams in traffic-split using upstream_id
+			for i, upstream := range upstreams {
+				weight := apiv2.DefaultWeight
+				// get weight from the backend refs starting from the second backend
+				if i+1 < len(rule.BackendRefs) && rule.BackendRefs[i+1].Weight != nil {
+					weight = int(*rule.BackendRefs[i+1].Weight)
+				}
+				weightedUpstreams = append(weightedUpstreams, adctypes.TrafficSplitConfigRuleWeightedUpstream{
+					UpstreamID: upstream.ID,
+					Weight:     weight,
+				})
+			}
+
+			if len(weightedUpstreams) > 0 {
+				if service.Plugins == nil {
+					service.Plugins = make(map[string]any)
+				}
+				service.Plugins["traffic-split"] = &adctypes.TrafficSplitConfig{
+					Rules: []adctypes.TrafficSplitConfigRule{
+						{
+							WeightedUpstreams: weightedUpstreams,
+						},
+					},
+				}
+			}
+		}
+
+		// One set of stream routes per rule, each carrying the SNIs of its own
+		// port, rather than one set per hostname: buildL4StreamRoutes names them by
+		// rule and port only, so a per hostname loop produced N sets sharing one ID
+		// and only the last survived.
+		streamRoutes, err := t.buildL4StreamRoutes(tctx, tlsRoute.Namespace, tlsRoute.Name, ruleIndex, "TLS", "TLSRoute", labels)
+		if err != nil {
+			return nil, err
+		}
+		for _, streamRoute := range streamRoutes {
+			snis := tlsRouteSNIsForPort(tctx.Listeners, tlsRoute.Spec.Hostnames, streamRoute.ServerPort)
+			if len(snis) == 0 {
+				// Nothing for the stream route to match on. The listeners a route
+				// attaches to already intersect its hostnames, so this is a guard
+				// against emitting a route that would answer every SNI instead.
+				continue
+			}
+			// A single SNI keeps using the singular form: it is what every
+			// APISIX version understands, and snis only earns its place once
+			// there is more than one to match.
+			if len(snis) == 1 {
+				streamRoute.SNI = snis[0]
+			} else {
+				streamRoute.SNIs = snis
+			}
+			if tlsPassthroughOnPort(tctx.Listeners, streamRoute.ServerPort) {
+				streamRoute.TLSPassthrough = ptr.To(true)
+			}
+			service.StreamRoutes = append(service.StreamRoutes, streamRoute)
+		}
+
+		result.Services = append(result.Services, service)
+	}
+	return result, nil
+}
+
+// tlsRouteSNIsForPort returns the SNIs the stream route bound to port matches on.
+//
+// The set is derived from the listeners on that port alone. Handing every port
+// the route-wide union instead would let a port answer a hostname its own
+// listener never accepted, and would cost a port its catch-all as soon as a
+// listener on another port named a hostname. port 0 means the stream route
+// carries no server_port match, so every matched listener applies.
+//
+// A TLSRoute without hostnames matches everything its listeners accept, so it
+// falls back to the hostnames of the listeners on the port and, when one of them
+// carries no hostname either, to the catch-all "*". Emitting nothing - which is
+// what the per hostname loop used to do - left such a route attached but
+// unserved.
+func tlsRouteSNIsForPort(listeners []gatewayv1.Listener, routeHostnames []gatewayv1.Hostname, port int32) []string {
+	matched := make([]gatewayv1.Listener, 0, len(listeners))
+	for _, listener := range listeners {
+		if listener.Protocol != gatewayv1.TLSProtocolType {
+			continue
+		}
+		if port != 0 && listener.Port != port {
+			continue
+		}
+		matched = append(matched, listener)
+	}
+
+	// No listener to narrow against: keep what the route itself asks for.
+	if len(matched) == 0 {
+		if len(routeHostnames) == 0 {
+			return []string{"*"}
+		}
+		return hostnamesToSNIs(routeHostnames)
+	}
+
+	if len(routeHostnames) == 0 {
+		hostnames, matchAnyHost := cutils.UnionHostnames(matched)
+		if matchAnyHost {
+			return []string{"*"}
+		}
+		return hostnamesToSNIs(cutils.DedupHostnames(hostnames))
+	}
+
+	snis := make([]gatewayv1.Hostname, 0, len(routeHostnames))
+	for _, hostname := range routeHostnames {
+		snis = append(snis, cutils.NarrowHostname(matched, hostname)...)
+	}
+	return hostnamesToSNIs(cutils.DedupHostnames(snis))
+}
+
+func hostnamesToSNIs(hostnames []gatewayv1.Hostname) []string {
+	snis := make([]string, 0, len(hostnames))
+	for _, hostname := range hostnames {
+		snis = append(snis, string(hostname))
+	}
+	return snis
+}
+
+// tlsPassthroughOnPort reports whether the stream routes bound to port must
+// forward the connection untouched instead of having the gateway terminate it.
+// port 0 means the StreamRoute carries no server_port match, so every matched
+// listener applies.
+//
+// Every TLS listener this route matched on the port has to agree. Within one
+// Gateway a port carrying both modes is already reported ProtocolConflict and
+// attaches no routes; a route attached to two Gateways that disagree falls back
+// to terminating rather than to a guess, since the physical stream listen has a
+// single mode.
+//
+// Two *different* routes attached to two disagreeing Gateways are each
+// translated for the mode their own listener declares, and only one of those is
+// the mode the listen was configured with. The controller does not configure the
+// stream listen, so it can neither detect that nor resolve it.
+func tlsPassthroughOnPort(listeners []gatewayv1.Listener, port int32) bool {
+	matched := false
+	for _, listener := range listeners {
+		if listener.Protocol != gatewayv1.TLSProtocolType {
+			continue
+		}
+		if port != 0 && listener.Port != port {
+			continue
+		}
+		if listener.TLS == nil || listener.TLS.Mode == nil || *listener.TLS.Mode != gatewayv1.TLSModePassthrough {
+			return false
+		}
+		matched = true
+	}
+	return matched
+}

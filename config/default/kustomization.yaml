@@ -1,0 +1,111 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Adds namespace to all resources.
+namespace: apisix-ingress-system
+
+# Value of this field is prepended to the names of all resources, e.g. a
+# deployment named "wordpress" becomes "alices-wordpress". It should also match
+# the prefix (text before '-') of the namespace field above.
+namePrefix: apisix-ingress-
+
+resources:
+- ../crd
+- ../rbac
+- ../manager
+# [WEBHOOK] To enable the admission webhook, uncomment ../webhook, ../certmanager,
+# the patches and the replacements below, and set `webhook.enable` to true in
+# config/manager/config.yaml. cert-manager (https://cert-manager.io) must be
+# installed in the cluster to issue the serving certificate.
+#- ../webhook
+#- ../certmanager
+# [METRICS] Expose the controller manager metrics service.
+- metrics_service.yaml
+# [PROMETHEUS] To scrape the metrics with the Prometheus Operator, uncomment
+# the following line. It requires the ServiceMonitor CRD.
+#- ../prometheus
+# [NETWORK-POLICY] To restrict traffic to the controller, uncomment the
+# following line. It only admits webhook calls from namespaces labeled
+# `webhook: enabled` and metrics scrapes from namespaces labeled
+# `metrics: enabled`; everything else reaching the pod is denied.
+#- ../network-policy
+
+# [WEBHOOK] Mount the serving certificate into the manager and let cert-manager
+# inject the CA bundle into the webhook configuration.
+#patches:
+#- path: manager_webhook_patch.yaml
+#  target:
+#    kind: Deployment
+#    name: controller-manager
+#- path: webhookcainjection_patch.yaml
+#  target:
+#    kind: ValidatingWebhookConfiguration
+#    name: validating-webhook-configuration
+
+# [WEBHOOK] Inject the cert-manager CA into the webhook configuration, and the
+# webhook Service name/namespace into the certificate's dnsNames.
+#replacements:
+#- source: # Add the cert-manager annotation to the ValidatingWebhookConfiguration
+#    kind: Certificate
+#    group: cert-manager.io
+#    version: v1
+#    name: serving-cert # this name should match the one in certificate-webhook.yaml
+#    fieldPath: .metadata.namespace # namespace of the certificate CR
+#  targets:
+#  - select:
+#      kind: ValidatingWebhookConfiguration
+#    fieldPaths:
+#    - .metadata.annotations.[cert-manager.io/inject-ca-from]
+#    options:
+#      delimiter: '/'
+#      index: 0
+#      create: true
+#- source:
+#    kind: Certificate
+#    group: cert-manager.io
+#    version: v1
+#    name: serving-cert
+#    fieldPath: .metadata.name
+#  targets:
+#  - select:
+#      kind: ValidatingWebhookConfiguration
+#    fieldPaths:
+#    - .metadata.annotations.[cert-manager.io/inject-ca-from]
+#    options:
+#      delimiter: '/'
+#      index: 1
+#      create: true
+#- source: # Add the webhook Service name to the certificate dnsNames
+#    kind: Service
+#    version: v1
+#    name: webhook-service
+#    fieldPath: .metadata.name
+#  targets:
+#  - select:
+#      kind: Certificate
+#      group: cert-manager.io
+#      version: v1
+#    fieldPaths:
+#    - .spec.dnsNames.0
+#    - .spec.dnsNames.1
+#    options:
+#      delimiter: '.'
+#      index: 0
+#      create: true
+#- source: # Add the webhook Service namespace to the certificate dnsNames
+#    kind: Service
+#    version: v1
+#    name: webhook-service
+#    fieldPath: .metadata.namespace
+#  targets:
+#  - select:
+#      kind: Certificate
+#      group: cert-manager.io
+#      version: v1
+#    fieldPaths:
+#    - .spec.dnsNames.0
+#    - .spec.dnsNames.1
+#    options:
+#      delimiter: '.'
+#      index: 1
+#      create: true

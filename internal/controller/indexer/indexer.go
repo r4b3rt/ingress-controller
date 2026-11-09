@@ -1,0 +1,1143 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package indexer
+
+import (
+	"cmp"
+	"context"
+
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/apache/apisix-ingress-controller/api/v1alpha1"
+	apiv2 "github.com/apache/apisix-ingress-controller/api/v2"
+	"github.com/apache/apisix-ingress-controller/internal/adc/translator/annotations"
+	internaltypes "github.com/apache/apisix-ingress-controller/internal/types"
+	k8sutils "github.com/apache/apisix-ingress-controller/internal/utils"
+	"github.com/apache/apisix-ingress-controller/pkg/utils"
+)
+
+const (
+	ServiceIndexRef           = "serviceRefs"
+	ExtensionRef              = "extensionRef"
+	ParametersRef             = "parametersRef"
+	ParentRefs                = "parentRefs"
+	IngressClass              = "ingressClass"
+	SecretIndexRef            = "secretRefs"
+	ConfigMapIndexRef         = "configMapRefs"
+	IngressClassRef           = "ingressClassRef"
+	IngressClassParametersRef = "ingressClassParametersRef"
+	ConsumerGatewayRef        = "consumerGatewayRef"
+	PolicyTargetRefs          = "targetRefs"
+	TLSHostIndexRef           = "tlsHostRefs"
+	GatewayClassIndexRef      = "gatewayClassRef"
+	ApisixUpstreamRef         = "apisixUpstreamRef"
+	PluginConfigIndexRef      = "pluginConfigRefs"
+	ControllerName            = "controllerName"
+)
+
+func SetupAPIv1alpha1Indexer(mgr ctrl.Manager) error {
+	setupLog := ctrl.LoggerFrom(context.Background()).WithName("indexer").WithName("apiv1alpha1")
+	for resource, setup := range map[client.Object]func(ctrl.Manager) error{
+		&v1alpha1.BackendTrafficPolicy{}: setupBackendTrafficPolicyIndexer,
+		&v1alpha1.Consumer{}:             setupConsumerIndexer,
+		&v1alpha1.GatewayProxy{}:         setupGatewayProxyIndexer,
+		&v1alpha1.L4RoutePolicy{}:        setupL4RoutePolicyIndexer,
+		&v1alpha1.PluginConfig{}:         setupPluginConfigIndexer,
+	} {
+		installed, err := utils.HasAPIResource(mgr, resource)
+		if err != nil {
+			return err
+		}
+		if !installed {
+			setupLog.Info("Skipping indexer setup, API not found in cluster", "api", utils.FormatGVK(resource))
+			continue
+		}
+		if err := setup(mgr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func SetupAPIv2Indexer(mgr ctrl.Manager) error {
+	setupLog := ctrl.LoggerFrom(context.Background()).WithName("indexer").WithName("apiv2")
+
+	for resource, setup := range map[client.Object]func(ctrl.Manager) error{
+		&networkingv1.IngressClass{}: setupIngressClassIndexer,
+		&networkingv1.Ingress{}:      setupIngressIndexer,
+		&apiv2.ApisixConsumer{}:      setupApisixConsumerIndexer,
+		&apiv2.ApisixRoute{}:         setupApisixRouteIndexer,
+		&apiv2.ApisixPluginConfig{}:  setupApisixPluginConfigIndexer,
+		&apiv2.ApisixTls{}:           setupApisixTlsIndexer,
+		&apiv2.ApisixGlobalRule{}:    setupApisixGlobalRuleIndexer,
+	} {
+		installed, err := utils.HasAPIResource(mgr, resource)
+		if err != nil {
+			return err
+		}
+		if !installed {
+			setupLog.Info("Skipping indexer setup, API not found in cluster", "api", utils.FormatGVK(resource))
+			continue
+		}
+		if err := setup(mgr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func SetupGatewayAPIIndexer(mgr ctrl.Manager) error {
+	setupLog := ctrl.LoggerFrom(context.Background()).WithName("indexer").WithName("gatewayapi")
+
+	for resource, setup := range map[client.Object]func(ctrl.Manager) error{
+		&gatewayv1.Gateway{}:      setupGatewayIndexer,
+		&gatewayv1.HTTPRoute{}:    setupHTTPRouteIndexer,
+		&gatewayv1.GRPCRoute{}:    setupGRPCRouteIndexer,
+		&gatewayv1.TCPRoute{}:     setupTCPRouteIndexer,
+		&gatewayv1.UDPRoute{}:     setupUDPRouteIndexer,
+		&gatewayv1.TLSRoute{}:     setupTLSRouteIndexer,
+		&gatewayv1.GatewayClass{}: setupGatewayClassIndexer,
+	} {
+		installed, err := utils.HasAPIResource(mgr, resource)
+		if err != nil {
+			return err
+		}
+		if !installed {
+			setupLog.Info("Skipping indexer setup, API not found in cluster", "api", utils.FormatGVK(resource))
+			continue
+		}
+		if err := setup(mgr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func setupGatewayIndexer(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.Gateway{},
+		ParametersRef,
+		GatewayParametersRefIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.Gateway{},
+		GatewayClassIndexRef,
+		func(obj client.Object) (requests []string) {
+			return []string{string(obj.(*gatewayv1.Gateway).Spec.GatewayClassName)}
+		},
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.Gateway{},
+		TLSHostIndexRef,
+		GatewayTLSHostIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.Gateway{},
+		SecretIndexRef,
+		GatewaySecretIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.Gateway{},
+		ConfigMapIndexRef,
+		GatewayConfigMapIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func setupConsumerIndexer(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&v1alpha1.Consumer{},
+		ConsumerGatewayRef,
+		ConsumerGatewayRefIndexFunc,
+	); err != nil {
+		return err
+	}
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&v1alpha1.Consumer{},
+		SecretIndexRef,
+		ConsumerSecretIndexFunc,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func setupApisixRouteIndexer(mgr ctrl.Manager) error {
+	var indexers = map[string]func(client.Object) []string{
+		ServiceIndexRef:      ApisixRouteServiceIndexFunc(mgr.GetClient()),
+		SecretIndexRef:       ApisixRouteSecretIndexFunc(mgr.GetClient()),
+		ApisixUpstreamRef:    ApisixRouteApisixUpstreamIndexFunc,
+		PluginConfigIndexRef: ApisixRoutePluginConfigIndexFunc,
+	}
+	for key, f := range indexers {
+		if err := mgr.GetFieldIndexer().IndexField(context.Background(), &apiv2.ApisixRoute{}, key, f); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func setupApisixPluginConfigIndexer(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&apiv2.ApisixPluginConfig{},
+		SecretIndexRef,
+		ApisixPluginConfigSecretIndexFunc,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func setupApisixConsumerIndexer(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&apiv2.ApisixConsumer{},
+		SecretIndexRef,
+		ApisixConsumerSecretIndexFunc,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ConsumerSecretIndexFunc(rawObj client.Object) []string {
+	consumer := rawObj.(*v1alpha1.Consumer)
+	secretKeys := make([]string, 0)
+
+	for _, credential := range consumer.Spec.Credentials {
+		if credential.SecretRef == nil {
+			continue
+		}
+		ns := consumer.GetNamespace()
+		if credential.SecretRef.Namespace != nil {
+			ns = *credential.SecretRef.Namespace
+		}
+		key := GenIndexKey(ns, credential.SecretRef.Name)
+		secretKeys = append(secretKeys, key)
+	}
+	secretKeys = append(secretKeys, PluginSecretIndexKeys(consumer.GetNamespace(), consumer.Spec.Plugins)...)
+	return secretKeys
+}
+
+func ConsumerGatewayRefIndexFunc(rawObj client.Object) []string {
+	consumer := rawObj.(*v1alpha1.Consumer)
+
+	if consumer.Spec.GatewayRef.Name == "" {
+		return nil
+	}
+
+	ns := consumer.GetNamespace()
+	if consumer.Spec.GatewayRef.Namespace != nil {
+		ns = *consumer.Spec.GatewayRef.Namespace
+	}
+	return []string{GenIndexKey(ns, consumer.Spec.GatewayRef.Name)}
+}
+
+func setupHTTPRouteIndexer(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.HTTPRoute{},
+		ParentRefs,
+		HTTPRouteParentRefsIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.HTTPRoute{},
+		ExtensionRef,
+		HTTPRouteExtensionIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.HTTPRoute{},
+		ServiceIndexRef,
+		HTTPRouteServiceIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&v1alpha1.HTTPRoutePolicy{},
+		PolicyTargetRefs,
+		HTTPRoutePolicyIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func setupTCPRouteIndexer(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.TCPRoute{},
+		ParentRefs,
+		TCPRouteParentRefsIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.TCPRoute{},
+		ServiceIndexRef,
+		TCPPRouteServiceIndexFunc,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func setupUDPRouteIndexer(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.UDPRoute{},
+		ParentRefs,
+		UDPRouteParentRefsIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.UDPRoute{},
+		ServiceIndexRef,
+		UDPRouteServiceIndexFunc,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func setupIngressClassIndexer(mgr ctrl.Manager) error {
+	// create IngressClass index
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&networkingv1.IngressClass{},
+		IngressClass,
+		IngressClassIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	// create IngressClassParametersRef index
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&networkingv1.IngressClass{},
+		IngressClassParametersRef,
+		IngressClassParametersRefIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func setupGatewayProxyIndexer(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&v1alpha1.GatewayProxy{},
+		ServiceIndexRef,
+		GatewayProxyServiceIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&v1alpha1.GatewayProxy{},
+		SecretIndexRef,
+		GatewayProxySecretIndexFunc,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func setupGatewayClassIndexer(mgr ctrl.Manager) error {
+	return mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&gatewayv1.GatewayClass{},
+		ControllerName,
+		func(obj client.Object) []string {
+			return []string{string(obj.(*gatewayv1.GatewayClass).Spec.ControllerName)}
+		},
+	)
+}
+
+func GatewayProxyServiceIndexFunc(rawObj client.Object) []string {
+	gatewayProxy := rawObj.(*v1alpha1.GatewayProxy)
+	if gatewayProxy.Spec.Provider != nil &&
+		gatewayProxy.Spec.Provider.ControlPlane != nil &&
+		gatewayProxy.Spec.Provider.ControlPlane.Service != nil {
+		service := gatewayProxy.Spec.Provider.ControlPlane.Service
+		return []string{GenIndexKey(gatewayProxy.GetNamespace(), service.Name)}
+	}
+	return nil
+}
+
+func GatewayProxySecretIndexFunc(rawObj client.Object) []string {
+	gatewayProxy := rawObj.(*v1alpha1.GatewayProxy)
+	secretKeys := make([]string, 0)
+
+	// Check if provider is ControlPlane type and has AdminKey auth
+	if gatewayProxy.Spec.Provider != nil &&
+		gatewayProxy.Spec.Provider.Type == v1alpha1.ProviderTypeControlPlane &&
+		gatewayProxy.Spec.Provider.ControlPlane != nil &&
+		gatewayProxy.Spec.Provider.ControlPlane.Auth.Type == v1alpha1.AuthTypeAdminKey &&
+		gatewayProxy.Spec.Provider.ControlPlane.Auth.AdminKey != nil &&
+		gatewayProxy.Spec.Provider.ControlPlane.Auth.AdminKey.ValueFrom != nil &&
+		gatewayProxy.Spec.Provider.ControlPlane.Auth.AdminKey.ValueFrom.SecretKeyRef != nil {
+
+		ref := gatewayProxy.Spec.Provider.ControlPlane.Auth.AdminKey.ValueFrom.SecretKeyRef
+		ns := gatewayProxy.GetNamespace()
+		key := GenIndexKey(ns, ref.Name)
+		secretKeys = append(secretKeys, key)
+	}
+	return secretKeys
+}
+
+func setupIngressIndexer(mgr ctrl.Manager) error {
+	// create IngressClass index
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&networkingv1.Ingress{},
+		IngressClassRef,
+		IngressClassRefIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	// create Service index for quick lookup of Ingresses using specific services
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&networkingv1.Ingress{},
+		ServiceIndexRef,
+		IngressServiceIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	// create secret index for TLS
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&networkingv1.Ingress{},
+		SecretIndexRef,
+		IngressSecretIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&networkingv1.Ingress{},
+		TLSHostIndexRef,
+		IngressTLSHostIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&networkingv1.Ingress{},
+		PluginConfigIndexRef,
+		IngressPluginConfigIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func setupBackendTrafficPolicyIndexer(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&v1alpha1.BackendTrafficPolicy{},
+		PolicyTargetRefs,
+		BackendTrafficPolicyIndexFunc,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func setupL4RoutePolicyIndexer(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&v1alpha1.L4RoutePolicy{},
+		PolicyTargetRefs,
+		L4RoutePolicyIndexFunc,
+	); err != nil {
+		return err
+	}
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&v1alpha1.L4RoutePolicy{},
+		SecretIndexRef,
+		func(obj client.Object) []string {
+			return PluginSecretIndexKeys(obj.GetNamespace(), obj.(*v1alpha1.L4RoutePolicy).Spec.Plugins)
+		},
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func setupPluginConfigIndexer(mgr ctrl.Manager) error {
+	return mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&v1alpha1.PluginConfig{},
+		SecretIndexRef,
+		func(obj client.Object) []string {
+			return PluginSecretIndexKeys(obj.GetNamespace(), obj.(*v1alpha1.PluginConfig).Spec.Plugins)
+		},
+	)
+}
+
+// PluginSecretIndexKeys returns the index keys of the Secrets referenced by
+// apisix.apache.org/v1alpha1 plugins. Such Secrets are always in the namespace of the
+// object that declares the plugins.
+func PluginSecretIndexKeys(namespace string, plugins []v1alpha1.Plugin) (keys []string) {
+	for _, plugin := range plugins {
+		if plugin.SecretRef == nil || plugin.SecretRef.Name == "" {
+			continue
+		}
+		keys = append(keys, GenIndexKey(namespace, plugin.SecretRef.Name))
+	}
+	return
+}
+
+func IngressClassIndexFunc(rawObj client.Object) []string {
+	ingressClass := rawObj.(*networkingv1.IngressClass)
+	if ingressClass.Spec.Controller == "" {
+		return nil
+	}
+	controllerName := ingressClass.Spec.Controller
+	return []string{controllerName}
+}
+
+func IngressClassRefIndexFunc(rawObj client.Object) []string {
+	ingress := rawObj.(*networkingv1.Ingress)
+	ingressClassName := internaltypes.GetEffectiveIngressClassName(ingress)
+	if ingressClassName == "" {
+		return nil
+	}
+	return []string{ingressClassName}
+}
+
+func IngressServiceIndexFunc(rawObj client.Object) []string {
+	ingress := rawObj.(*networkingv1.Ingress)
+	var services []string
+
+	ns := ingress.Namespace
+	if svcNs := ingress.Annotations[annotations.AnnotationsSvcNamespace]; svcNs != "" {
+		ns = svcNs
+	}
+	for _, rule := range ingress.Spec.Rules {
+		if rule.HTTP == nil {
+			continue
+		}
+
+		for _, path := range rule.HTTP.Paths {
+			if path.Backend.Service == nil {
+				continue
+			}
+			key := GenIndexKey(ns, path.Backend.Service.Name)
+			services = append(services, key)
+		}
+	}
+	return services
+}
+
+func IngressSecretIndexFunc(rawObj client.Object) []string {
+	ingress := rawObj.(*networkingv1.Ingress)
+	secrets := make([]string, 0)
+
+	for _, tls := range ingress.Spec.TLS {
+		if tls.SecretName == "" {
+			continue
+		}
+
+		key := GenIndexKey(ingress.Namespace, tls.SecretName)
+		secrets = append(secrets, key)
+	}
+	return secrets
+}
+
+func GatewaySecretIndexFunc(rawObj client.Object) (keys []string) {
+	gateway := rawObj.(*gatewayv1.Gateway)
+	var m = make(map[string]struct{})
+	add := func(namespace, name string) {
+		key := GenIndexKey(namespace, name)
+		if _, ok := m[key]; !ok {
+			m[key] = struct{}{}
+			keys = append(keys, key)
+		}
+	}
+	for _, listener := range gateway.Spec.Listeners {
+		if listener.TLS == nil {
+			continue
+		}
+		for _, ref := range listener.TLS.CertificateRefs {
+			if ref.Kind == nil || *ref.Kind != internaltypes.KindSecret {
+				continue
+			}
+			namespace := gateway.GetNamespace()
+			if ref.Namespace != nil {
+				namespace = string(*ref.Namespace)
+			}
+			add(namespace, string(ref.Name))
+		}
+	}
+	// frontendValidation CA references that are Secrets. In Gateway API v1.6 these
+	// live at the Gateway level (spec.tls.frontend), not on individual listeners.
+	for _, validation := range gatewayFrontendValidations(gateway) {
+		for _, ref := range validation.CACertificateRefs {
+			if string(ref.Kind) != internaltypes.KindSecret {
+				continue
+			}
+			namespace := gateway.GetNamespace()
+			if ref.Namespace != nil {
+				namespace = string(*ref.Namespace)
+			}
+			add(namespace, string(ref.Name))
+		}
+	}
+	return keys
+}
+
+// gatewayFrontendValidations returns all frontend TLS client-cert validation configs
+// declared on a Gateway (the Default plus every PerPort override).
+func gatewayFrontendValidations(gateway *gatewayv1.Gateway) []*gatewayv1.FrontendTLSValidation {
+	if gateway.Spec.TLS == nil || gateway.Spec.TLS.Frontend == nil {
+		return nil
+	}
+	frontend := gateway.Spec.TLS.Frontend
+	validations := make([]*gatewayv1.FrontendTLSValidation, 0, len(frontend.PerPort)+1)
+	if frontend.Default.Validation != nil {
+		validations = append(validations, frontend.Default.Validation)
+	}
+	for i := range frontend.PerPort {
+		if frontend.PerPort[i].TLS.Validation != nil {
+			validations = append(validations, frontend.PerPort[i].TLS.Validation)
+		}
+	}
+	return validations
+}
+
+// GatewayConfigMapIndexFunc indexes Gateways by the CA ConfigMaps referenced via
+// Gateway TLS frontendValidation, so that ConfigMap changes can trigger reconciliation.
+func GatewayConfigMapIndexFunc(rawObj client.Object) (keys []string) {
+	gateway := rawObj.(*gatewayv1.Gateway)
+	var m = make(map[string]struct{})
+	for _, validation := range gatewayFrontendValidations(gateway) {
+		for _, ref := range validation.CACertificateRefs {
+			if ref.Kind != "" && string(ref.Kind) != internaltypes.KindConfigMap {
+				continue
+			}
+			namespace := gateway.GetNamespace()
+			if ref.Namespace != nil {
+				namespace = string(*ref.Namespace)
+			}
+			key := GenIndexKey(namespace, string(ref.Name))
+			if _, ok := m[key]; !ok {
+				m[key] = struct{}{}
+				keys = append(keys, key)
+			}
+		}
+	}
+	return keys
+}
+
+func GenIndexKeyWithGK(group, kind, namespace, name string) string {
+	gvk := schema.GroupKind{
+		Group: group,
+		Kind:  kind,
+	}
+	nsName := types.NamespacedName{
+		Namespace: namespace,
+		Name:      name,
+	}
+	return gvk.String() + "/" + nsName.String()
+}
+
+func GenIndexKey(namespace, name string) string {
+	return client.ObjectKey{
+		Namespace: namespace,
+		Name:      name,
+	}.String()
+}
+
+func HTTPRouteParentRefsIndexFunc(rawObj client.Object) []string {
+	hr := rawObj.(*gatewayv1.HTTPRoute)
+	keys := make([]string, 0, len(hr.Spec.ParentRefs))
+	for _, ref := range hr.Spec.ParentRefs {
+		ns := hr.GetNamespace()
+		if ref.Namespace != nil {
+			ns = string(*ref.Namespace)
+		}
+		keys = append(keys, GenIndexKey(ns, string(ref.Name)))
+	}
+	return keys
+}
+
+func TCPRouteParentRefsIndexFunc(rawObj client.Object) []string {
+	tr := rawObj.(*gatewayv1.TCPRoute)
+	keys := make([]string, 0, len(tr.Spec.ParentRefs))
+	for _, ref := range tr.Spec.ParentRefs {
+		ns := tr.GetNamespace()
+		if ref.Namespace != nil {
+			ns = string(*ref.Namespace)
+		}
+		keys = append(keys, GenIndexKey(ns, string(ref.Name)))
+	}
+	return keys
+}
+
+func UDPRouteParentRefsIndexFunc(rawObj client.Object) []string {
+	ur := rawObj.(*gatewayv1.UDPRoute)
+	keys := make([]string, 0, len(ur.Spec.ParentRefs))
+	for _, ref := range ur.Spec.ParentRefs {
+		ns := ur.GetNamespace()
+		if ref.Namespace != nil {
+			ns = string(*ref.Namespace)
+		}
+		keys = append(keys, GenIndexKey(ns, string(ref.Name)))
+	}
+	return keys
+}
+
+func HTTPRouteServiceIndexFunc(rawObj client.Object) []string {
+	hr := rawObj.(*gatewayv1.HTTPRoute)
+	keys := make([]string, 0, len(hr.Spec.Rules))
+	for _, rule := range hr.Spec.Rules {
+		for _, backend := range rule.BackendRefs {
+			namespace := hr.GetNamespace()
+			if backend.Kind != nil && *backend.Kind != internaltypes.KindService {
+				continue
+			}
+			if backend.Namespace != nil {
+				namespace = string(*backend.Namespace)
+			}
+			keys = append(keys, GenIndexKey(namespace, string(backend.Name)))
+		}
+	}
+	return keys
+}
+
+func TCPPRouteServiceIndexFunc(rawObj client.Object) []string {
+	tr := rawObj.(*gatewayv1.TCPRoute)
+	keys := make([]string, 0, len(tr.Spec.Rules))
+	for _, rule := range tr.Spec.Rules {
+		for _, backend := range rule.BackendRefs {
+			namespace := tr.GetNamespace()
+			if backend.Kind != nil && *backend.Kind != internaltypes.KindService {
+				continue
+			}
+			if backend.Namespace != nil {
+				namespace = string(*backend.Namespace)
+			}
+			keys = append(keys, GenIndexKey(namespace, string(backend.Name)))
+		}
+	}
+	return keys
+}
+
+func UDPRouteServiceIndexFunc(rawObj client.Object) []string {
+	ur := rawObj.(*gatewayv1.UDPRoute)
+	keys := make([]string, 0, len(ur.Spec.Rules))
+	for _, rule := range ur.Spec.Rules {
+		for _, backend := range rule.BackendRefs {
+			namespace := ur.GetNamespace()
+			if backend.Kind != nil && *backend.Kind != internaltypes.KindService {
+				continue
+			}
+			if backend.Namespace != nil {
+				namespace = string(*backend.Namespace)
+			}
+			keys = append(keys, GenIndexKey(namespace, string(backend.Name)))
+		}
+	}
+	return keys
+}
+
+func ApisixRouteServiceIndexFunc(cli client.Client) func(client.Object) []string {
+	return func(obj client.Object) (keys []string) {
+		ar := obj.(*apiv2.ApisixRoute)
+		for _, http := range ar.Spec.HTTP {
+			// service reference in .backends
+			for _, backend := range http.Backends {
+				keys = append(keys, GenIndexKey(ar.GetNamespace(), backend.ServiceName))
+			}
+			// service reference in .upstreams
+			for _, upstream := range http.Upstreams {
+				if upstream.Name == "" {
+					continue
+				}
+				var (
+					au   apiv2.ApisixUpstream
+					auNN = types.NamespacedName{
+						Namespace: ar.GetNamespace(),
+						Name:      upstream.Name,
+					}
+				)
+				if err := cli.Get(context.Background(), auNN, &au); err != nil {
+					continue
+				}
+				for _, node := range au.Spec.ExternalNodes {
+					if node.Type == apiv2.ExternalTypeService && node.Name != "" {
+						keys = append(keys, GenIndexKey(au.GetNamespace(), node.Name))
+					}
+				}
+			}
+		}
+		for _, stream := range ar.Spec.Stream {
+			keys = append(keys, GenIndexKey(ar.GetNamespace(), stream.Backend.ServiceName))
+		}
+		return keys
+	}
+}
+
+func ApisixRouteSecretIndexFunc(cli client.Client) func(client.Object) []string {
+	return func(obj client.Object) (keys []string) {
+		ar := obj.(*apiv2.ApisixRoute)
+		for _, http := range ar.Spec.HTTP {
+			// secret reference in .plugins
+			for _, plugin := range http.Plugins {
+				if plugin.Enable && plugin.SecretRef != "" {
+					keys = append(keys, GenIndexKey(ar.GetNamespace(), plugin.SecretRef))
+				}
+			}
+			// secret reference in .upstreams
+			for _, upstream := range http.Upstreams {
+				if upstream.Name == "" {
+					continue
+				}
+				var (
+					au   apiv2.ApisixUpstream
+					auNN = types.NamespacedName{
+						Namespace: ar.GetNamespace(),
+						Name:      upstream.Name,
+					}
+				)
+				if err := cli.Get(context.Background(), auNN, &au); err != nil {
+					continue
+				}
+				if secret := au.Spec.TLSSecret; secret != nil && secret.Name != "" {
+					keys = append(keys, GenIndexKey(cmp.Or(secret.Namespace, au.GetNamespace()), secret.Name))
+				}
+			}
+		}
+		for _, stream := range ar.Spec.Stream {
+			for _, plugin := range stream.Plugins {
+				if plugin.Enable && plugin.SecretRef != "" {
+					keys = append(keys, GenIndexKey(ar.GetNamespace(), plugin.SecretRef))
+				}
+			}
+		}
+		return keys
+	}
+}
+
+func ApisixRouteApisixUpstreamIndexFunc(obj client.Object) (keys []string) {
+	ar := obj.(*apiv2.ApisixRoute)
+	for _, rule := range ar.Spec.HTTP {
+		for _, backend := range rule.Backends {
+			if backend.ServiceName != "" {
+				keys = append(keys, GenIndexKey(ar.GetNamespace(), backend.ServiceName))
+			}
+		}
+		for _, upstream := range rule.Upstreams {
+			if upstream.Name != "" {
+				keys = append(keys, GenIndexKey(ar.GetNamespace(), upstream.Name))
+			}
+		}
+	}
+	return
+}
+
+func ApisixRoutePluginConfigIndexFunc(obj client.Object) (keys []string) {
+	ar := obj.(*apiv2.ApisixRoute)
+	m := make(map[string]struct{})
+	for _, http := range ar.Spec.HTTP {
+		if http.PluginConfigName != "" {
+			ns := ar.GetNamespace()
+			if http.PluginConfigNamespace != "" {
+				ns = http.PluginConfigNamespace
+			}
+			key := GenIndexKey(ns, http.PluginConfigName)
+			if _, ok := m[key]; !ok {
+				m[key] = struct{}{}
+				keys = append(keys, key)
+			}
+		}
+	}
+	return
+}
+
+func HTTPRouteExtensionIndexFunc(rawObj client.Object) []string {
+	hr := rawObj.(*gatewayv1.HTTPRoute)
+	keys := make([]string, 0, len(hr.Spec.Rules))
+	for _, rule := range hr.Spec.Rules {
+		for _, filter := range rule.Filters {
+			if filter.Type != gatewayv1.HTTPRouteFilterExtensionRef || filter.ExtensionRef == nil {
+				continue
+			}
+			if internaltypes.IsPluginConfigExtensionRef(filter.ExtensionRef) {
+				keys = append(keys, GenIndexKey(hr.GetNamespace(), string(filter.ExtensionRef.Name)))
+			}
+		}
+	}
+	return keys
+}
+
+func HTTPRoutePolicyIndexFunc(rawObj client.Object) []string {
+	hrp := rawObj.(*v1alpha1.HTTPRoutePolicy)
+	var keys = make([]string, 0, len(hrp.Spec.TargetRefs))
+	var m = make(map[string]struct{})
+	for _, ref := range hrp.Spec.TargetRefs {
+		key := GenIndexKeyWithGK(string(ref.Group), string(ref.Kind), hrp.GetNamespace(), string(ref.Name))
+		if _, ok := m[key]; !ok {
+			m[key] = struct{}{}
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func GatewayParametersRefIndexFunc(rawObj client.Object) []string {
+	gw := rawObj.(*gatewayv1.Gateway)
+	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
+		// now we only care about kind: GatewayProxy
+		if gw.Spec.Infrastructure.ParametersRef.Kind == internaltypes.KindGatewayProxy {
+			name := gw.Spec.Infrastructure.ParametersRef.Name
+			return []string{GenIndexKey(gw.GetNamespace(), name)}
+		}
+	}
+	return nil
+}
+
+func BackendTrafficPolicyIndexFunc(rawObj client.Object) []string {
+	btp := rawObj.(*v1alpha1.BackendTrafficPolicy)
+	keys := make([]string, 0, len(btp.Spec.TargetRefs))
+	for _, ref := range btp.Spec.TargetRefs {
+		keys = append(keys,
+			GenIndexKeyWithGK(
+				string(ref.Group),
+				string(ref.Kind),
+				btp.GetNamespace(),
+				string(ref.Name),
+			),
+		)
+	}
+	return keys
+}
+
+func L4RoutePolicyIndexFunc(rawObj client.Object) []string {
+	lrp := rawObj.(*v1alpha1.L4RoutePolicy)
+	keys := make([]string, 0, len(lrp.Spec.TargetRefs))
+	m := make(map[string]struct{})
+	for _, ref := range lrp.Spec.TargetRefs {
+		key := GenIndexKeyWithGK(string(ref.Group), string(ref.Kind), lrp.GetNamespace(), string(ref.Name))
+		if _, ok := m[key]; !ok {
+			m[key] = struct{}{}
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func IngressClassParametersRefIndexFunc(rawObj client.Object) []string {
+	ingressClass := rawObj.(*networkingv1.IngressClass)
+	// check if the IngressClass references this gateway proxy
+	if ingressClass.Spec.Parameters != nil &&
+		ingressClass.Spec.Parameters.APIGroup != nil &&
+		*ingressClass.Spec.Parameters.APIGroup == v1alpha1.GroupVersion.Group &&
+		ingressClass.Spec.Parameters.Kind == internaltypes.KindGatewayProxy {
+		namespace := k8sutils.GetIngressClassParametersNamespace(*ingressClass)
+		return []string{GenIndexKey(namespace, ingressClass.Spec.Parameters.Name)}
+	}
+	return nil
+}
+
+func ApisixPluginConfigSecretIndexFunc(obj client.Object) (keys []string) {
+	pc := obj.(*apiv2.ApisixPluginConfig)
+	for _, plugin := range pc.Spec.Plugins {
+		if plugin.Enable && plugin.SecretRef != "" {
+			keys = append(keys, GenIndexKey(pc.GetNamespace(), plugin.SecretRef))
+		}
+	}
+	return
+}
+
+func ApisixConsumerSecretIndexFunc(rawObj client.Object) (keys []string) {
+	ac := rawObj.(*apiv2.ApisixConsumer)
+	var secretRef *corev1.LocalObjectReference
+	if ap := ac.Spec.AuthParameter; ap != nil {
+		if ap.KeyAuth != nil {
+			secretRef = ap.KeyAuth.SecretRef
+		} else if ap.BasicAuth != nil {
+			secretRef = ap.BasicAuth.SecretRef
+		} else if ap.JwtAuth != nil {
+			secretRef = ap.JwtAuth.SecretRef
+		} else if ap.WolfRBAC != nil {
+			secretRef = ap.WolfRBAC.SecretRef
+		} else if ap.HMACAuth != nil {
+			secretRef = ap.HMACAuth.SecretRef
+		} else if ap.LDAPAuth != nil {
+			secretRef = ap.LDAPAuth.SecretRef
+		}
+	}
+	if secretRef != nil && secretRef.Name != "" {
+		keys = append(keys, GenIndexKey(ac.GetNamespace(), secretRef.Name))
+	}
+	for _, plugin := range ac.Spec.Plugins {
+		if plugin.Enable && plugin.SecretRef != "" {
+			keys = append(keys, GenIndexKey(ac.GetNamespace(), plugin.SecretRef))
+		}
+	}
+	return
+}
+
+func setupApisixTlsIndexer(mgr ctrl.Manager) error {
+	// Create secret index for ApisixTls
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&apiv2.ApisixTls{},
+		SecretIndexRef,
+		ApisixTlsSecretIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	// Create ingress class index for ApisixTls
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&apiv2.ApisixTls{},
+		IngressClassRef,
+		ApisixTlsIngressClassIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&apiv2.ApisixTls{},
+		TLSHostIndexRef,
+		ApisixTlsHostIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func ApisixTlsSecretIndexFunc(rawObj client.Object) []string {
+	tls := rawObj.(*apiv2.ApisixTls)
+	secrets := make([]string, 0)
+
+	// Index the main TLS secret
+	key := GenIndexKey(tls.Spec.Secret.Namespace, tls.Spec.Secret.Name)
+	secrets = append(secrets, key)
+
+	// Index the client CA secret if mutual TLS is configured
+	if tls.Spec.Client != nil {
+		caKey := GenIndexKey(tls.Spec.Client.CASecret.Namespace, tls.Spec.Client.CASecret.Name)
+		secrets = append(secrets, caKey)
+	}
+
+	return secrets
+}
+
+func ApisixTlsIngressClassIndexFunc(rawObj client.Object) []string {
+	tls := rawObj.(*apiv2.ApisixTls)
+	if tls.Spec.IngressClassName == "" {
+		return nil
+	}
+	return []string{tls.Spec.IngressClassName}
+}
+
+func setupApisixGlobalRuleIndexer(mgr ctrl.Manager) error {
+	// Create secret index for ApisixGlobalRule
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&apiv2.ApisixGlobalRule{},
+		SecretIndexRef,
+		ApisixGlobalRuleSecretIndexFunc,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func ApisixGlobalRuleSecretIndexFunc(rawObj client.Object) []string {
+	agr := rawObj.(*apiv2.ApisixGlobalRule)
+	var keys []string
+	for _, plugin := range agr.Spec.Plugins {
+		if plugin.Enable && plugin.SecretRef != "" {
+			keys = append(keys, GenIndexKey(agr.GetNamespace(), plugin.SecretRef))
+		}
+	}
+	return keys
+}
+
+func IngressPluginConfigIndexFunc(rawObj client.Object) []string {
+	ingress := rawObj.(*networkingv1.Ingress)
+	pluginConfigName := ingress.Annotations[annotations.AnnotationsPluginConfigName]
+	if pluginConfigName == "" {
+		return nil
+	}
+
+	return []string{GenIndexKey(ingress.GetNamespace(), pluginConfigName)}
+}

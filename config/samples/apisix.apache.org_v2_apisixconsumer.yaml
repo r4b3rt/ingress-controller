@@ -1,0 +1,13 @@
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  labels:
+    app.kubernetes.io/name: apisix-ingress-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: apisixconsumer-sample
+spec:
+  ingressClassName: apisix
+  authParameter:
+    keyAuth:
+      value:
+        key: sample-key

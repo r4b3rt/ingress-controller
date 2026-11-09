@@ -1,0 +1,583 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package v2
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/types"
+
+	apiv2 "github.com/apache/apisix-ingress-controller/api/v2"
+	"github.com/apache/apisix-ingress-controller/test/e2e/framework"
+	"github.com/apache/apisix-ingress-controller/test/e2e/scaffold"
+)
+
+var _ = Describe("Test ApisixPluginConfig", Label("apisix.apache.org", "v2", "apisixpluginconfig"), func() {
+	var (
+		s       = scaffold.NewDefaultScaffold()
+		applier = framework.NewApplier(s.GinkgoT, s.K8sClient, s.CreateResourceFromString)
+	)
+
+	Context("Test ApisixPluginConfig", func() {
+		BeforeEach(func() {
+			By("create GatewayProxy")
+			err := s.CreateResourceFromString(s.GetGatewayProxySpec())
+			Expect(err).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+			By("create IngressClass")
+			err = s.CreateResourceFromStringWithNamespace(s.GetIngressClassYaml(), "")
+			Expect(err).NotTo(HaveOccurred(), "creating IngressClass")
+		})
+
+		It("Basic ApisixPluginConfig test", func() {
+			const apisixPluginConfigSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixPluginConfig
+metadata:
+  name: test-plugin-config
+spec:
+  ingressClassName: %s
+  plugins:
+  - name: response-rewrite
+    enable: true
+    config:
+      headers:
+        X-Plugin-Config: "test-response-rewrite"
+        X-Plugin-Test: "enabled"
+`
+
+			const apisixRouteSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: test-route
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      paths:
+      - /*
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    plugin_config_name: test-plugin-config
+`
+
+			By("apply ApisixPluginConfig")
+			var apisixPluginConfig apiv2.ApisixPluginConfig
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-plugin-config"},
+				&apisixPluginConfig, fmt.Sprintf(apisixPluginConfigSpec, s.Namespace()))
+
+			By("apply ApisixRoute that references ApisixPluginConfig")
+			var apisixRoute apiv2.ApisixRoute
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-route"},
+				&apisixRoute, fmt.Sprintf(apisixRouteSpec, s.Namespace()))
+
+			By("verify ApisixRoute works with plugin config")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Checks: []scaffold.ResponseCheckFunc{
+					scaffold.WithExpectedStatus(http.StatusOK),
+					scaffold.WithExpectedHeader("X-Plugin-Config", "test-response-rewrite"),
+					scaffold.WithExpectedHeader("X-Plugin-Test", "enabled"),
+				},
+			})
+
+			By("delete ApisixRoute")
+			err := s.DeleteResource("ApisixRoute", "test-route")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+
+			By("delete ApisixPluginConfig")
+			err = s.DeleteResource("ApisixPluginConfig", "test-plugin-config")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixPluginConfig")
+
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Check:  scaffold.WithExpectedStatus(http.StatusNotFound),
+			})
+		})
+
+		It("Test ApisixRoute stops serving when its ApisixPluginConfig is deleted", func() {
+			const pluginConfigSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixPluginConfig
+metadata:
+  name: shared-plugin-config
+spec:
+  ingressClassName: %s
+  plugins:
+  - name: response-rewrite
+    enable: true
+    config:
+      headers:
+        X-Revocation-Test: "must-disappear"
+`
+
+			const routeSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: referencing-route
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      paths:
+      - /*
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    plugin_config_name: shared-plugin-config
+`
+
+			applyPluginConfig := func() {
+				var pluginConfig apiv2.ApisixPluginConfig
+				applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "shared-plugin-config"},
+					&pluginConfig, fmt.Sprintf(pluginConfigSpec, s.Namespace()))
+			}
+
+			By("apply ApisixPluginConfig and a route that references it")
+			applyPluginConfig()
+			var apisixRoute apiv2.ApisixRoute
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "referencing-route"},
+				&apisixRoute, fmt.Sprintf(routeSpec, s.Namespace()))
+
+			By("the plugin takes effect")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Checks: []scaffold.ResponseCheckFunc{
+					scaffold.WithExpectedStatus(http.StatusOK),
+					scaffold.WithExpectedHeader("X-Revocation-Test", "must-disappear"),
+				},
+			})
+
+			By("delete only the ApisixPluginConfig, leaving the route in place")
+			Expect(s.DeleteResource("ApisixPluginConfig", "shared-plugin-config")).
+				ShouldNot(HaveOccurred(), "deleting ApisixPluginConfig")
+
+			By("the route stops being served")
+			// Without the retraction the route keeps forwarding and keeps applying the
+			// deleted plugin, so the header would still come back with a 200.
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method:   "GET",
+				Path:     "/get",
+				Check:    scaffold.WithExpectedStatus(http.StatusNotFound),
+				Timeout:  time.Second * 30,
+				Interval: time.Second * 2,
+			})
+
+			By("recreating the ApisixPluginConfig under the same name restores the route")
+			applyPluginConfig()
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Checks: []scaffold.ResponseCheckFunc{
+					scaffold.WithExpectedStatus(http.StatusOK),
+					scaffold.WithExpectedHeader("X-Revocation-Test", "must-disappear"),
+				},
+				Timeout:  time.Second * 30,
+				Interval: time.Second * 2,
+			})
+		})
+
+		It("Test ApisixPluginConfig update", func() {
+			const apisixPluginConfigSpecV1 = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixPluginConfig
+metadata:
+  name: test-plugin-config-update
+spec:
+  ingressClassName: %s
+  plugins:
+  - name: response-rewrite
+    enable: true
+    config:
+      headers:
+        X-Version: "v1"
+`
+
+			const apisixPluginConfigSpecV2 = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixPluginConfig
+metadata:
+  name: test-plugin-config-update
+spec:
+  ingressClassName: %s
+  plugins:
+  - name: response-rewrite
+    enable: true
+    config:
+      headers:
+        X-Version: "v2"
+        X-Updated: "true"
+`
+
+			const apisixRouteSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: test-route-update
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      paths:
+      - /*
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    plugin_config_name: test-plugin-config-update
+`
+
+			By("apply initial ApisixPluginConfig")
+			var apisixPluginConfig apiv2.ApisixPluginConfig
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-plugin-config-update"},
+				&apisixPluginConfig, fmt.Sprintf(apisixPluginConfigSpecV1, s.Namespace()))
+
+			By("apply ApisixRoute that references ApisixPluginConfig")
+			var apisixRoute apiv2.ApisixRoute
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-route-update"},
+				&apisixRoute, fmt.Sprintf(apisixRouteSpec, s.Namespace()))
+
+			By("verify initial plugin config works")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Checks: []scaffold.ResponseCheckFunc{
+					scaffold.WithExpectedStatus(http.StatusOK),
+					scaffold.WithExpectedHeader("X-Version", "v1"),
+					scaffold.WithExpectedHeader("X-Updated", ""),
+				},
+			})
+
+			By("update ApisixPluginConfig")
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-plugin-config-update"},
+				&apisixPluginConfig, fmt.Sprintf(apisixPluginConfigSpecV2, s.Namespace()))
+
+			By("verify updated plugin config works")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Checks: []scaffold.ResponseCheckFunc{
+					scaffold.WithExpectedStatus(http.StatusOK),
+					scaffold.WithExpectedHeader("X-Version", "v2"),
+					scaffold.WithExpectedHeader("X-Updated", "true"),
+				},
+			})
+
+			By("delete resources")
+			err := s.DeleteResource("ApisixRoute", "test-route-update")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+			err = s.DeleteResource("ApisixPluginConfig", "test-plugin-config-update")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixPluginConfig")
+		})
+
+		It("Test ApisixPluginConfig with disabled plugin", func() {
+			const apisixPluginConfigSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixPluginConfig
+metadata:
+  name: test-plugin-config-disabled
+spec:
+  ingressClassName: %s
+  plugins:
+  - name: response-rewrite
+    enable: false
+    config:
+      headers:
+        X-Should-Not-Exist: "disabled"
+  - name: cors
+    enable: true
+    config:
+      allow_origins: "*"
+      allow_methods: "GET,POST"
+`
+
+			const apisixRouteSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: test-route-disabled
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      paths:
+      - /*
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    plugin_config_name: test-plugin-config-disabled
+`
+
+			By("apply ApisixPluginConfig with disabled plugin")
+			var apisixPluginConfig apiv2.ApisixPluginConfig
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-plugin-config-disabled"},
+				&apisixPluginConfig, fmt.Sprintf(apisixPluginConfigSpec, s.Namespace()))
+
+			By("apply ApisixRoute that references ApisixPluginConfig")
+			var apisixRoute apiv2.ApisixRoute
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-route-disabled"},
+				&apisixRoute, fmt.Sprintf(apisixRouteSpec, s.Namespace()))
+
+			By("verify ApisixRoute works")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method:  "GET",
+				Path:    "/get",
+				Timeout: 60 * time.Second,
+				Checks: []scaffold.ResponseCheckFunc{
+					scaffold.WithExpectedStatus(http.StatusOK),
+					scaffold.WithExpectedNotHeader("X-Should-Not-Exist"),
+					scaffold.WithExpectedHeader("Access-Control-Allow-Origin", "*"),
+				},
+			})
+
+			By("delete resources")
+			err := s.DeleteResource("ApisixRoute", "test-route-disabled")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+			err = s.DeleteResource("ApisixPluginConfig", "test-plugin-config-disabled")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixPluginConfig")
+		})
+
+		It("Test ApisixPluginConfig overridden by route plugins", func() {
+			const apisixPluginConfigSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixPluginConfig
+metadata:
+  name: test-plugin-config-override
+spec:
+  ingressClassName: %s
+  plugins:
+  - name: response-rewrite
+    enable: true
+    config:
+      headers:
+        X-From-Config: "plugin-config"
+        X-Shared: "from-config"
+`
+
+			const apisixRouteSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: test-route-override
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      paths:
+      - /*
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    plugin_config_name: test-plugin-config-override
+    plugins:
+    - name: response-rewrite
+      enable: true
+      config:
+        headers:
+          X-From-Route: "route"
+          X-Shared: "from-route"
+`
+
+			By("apply ApisixPluginConfig")
+			var apisixPluginConfig apiv2.ApisixPluginConfig
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-plugin-config-override"},
+				&apisixPluginConfig, fmt.Sprintf(apisixPluginConfigSpec, s.Namespace()))
+
+			By("apply ApisixRoute with overriding plugins")
+			var apisixRoute apiv2.ApisixRoute
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-route-override"},
+				&apisixRoute, fmt.Sprintf(apisixRouteSpec, s.Namespace()))
+
+			By("verify ApisixRoute works")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Checks: []scaffold.ResponseCheckFunc{
+					scaffold.WithExpectedStatus(http.StatusOK),
+					scaffold.WithExpectedNotHeader("X-From-Config"),
+					scaffold.WithExpectedHeader("X-From-Route", "route"),
+					scaffold.WithExpectedHeader("X-Shared", "from-route"),
+				},
+			})
+
+			By("delete resources")
+			err := s.DeleteResource("ApisixRoute", "test-route-override")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+			err = s.DeleteResource("ApisixPluginConfig", "test-plugin-config-override")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixPluginConfig")
+		})
+
+		It("Test cross-namespace ApisixPluginConfig reference", Serial, func() {
+			const crossNamespaceApisixPluginConfigSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixPluginConfig
+metadata:
+  name: cross-ns-plugin-config
+  namespace: default
+spec:
+  ingressClassName: %s
+  plugins:
+  - name: response-rewrite
+    enable: true
+    config:
+      headers:
+        X-Cross-Namespace: "true"
+        X-Namespace: "default"
+`
+
+			const apisixRouteSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: test-route-cross-ns
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      paths:
+      - /*
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    plugin_config_name: cross-ns-plugin-config
+    plugin_config_namespace: default
+`
+
+			By("apply ApisixPluginConfig in default namespace")
+			err := s.CreateResourceFromStringWithNamespace(fmt.Sprintf(crossNamespaceApisixPluginConfigSpec, s.Namespace()), "default")
+			Expect(err).NotTo(HaveOccurred(), "creating default/cross-ns-plugin-config")
+
+			By("apply ApisixRoute in test namespace that references ApisixPluginConfig in default namespace")
+			var apisixRoute apiv2.ApisixRoute
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-route-cross-ns"},
+				&apisixRoute, fmt.Sprintf(apisixRouteSpec, s.Namespace()))
+
+			By("verify cross-namespace reference works")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Checks: []scaffold.ResponseCheckFunc{
+					scaffold.WithExpectedStatus(http.StatusOK),
+					scaffold.WithExpectedHeader("X-Cross-Namespace", "true"),
+					scaffold.WithExpectedHeader("X-Namespace", "default"),
+				},
+			})
+
+			By("delete resources")
+			err = s.DeleteResource("ApisixRoute", "test-route-cross-ns")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+			err = s.DeleteResourceFromStringWithNamespace(fmt.Sprintf(crossNamespaceApisixPluginConfigSpec, s.Namespace()), "default")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixPluginConfig")
+		})
+
+		It("Test ApisixPluginConfig with SecretRef", func() {
+			const secretSpec = `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: plugin-secret
+type: Opaque
+data:
+  key: dGVzdC1rZXk=
+  username: dGVzdC11c2Vy
+  password: dGVzdC1wYXNzd29yZA==
+`
+
+			const apisixPluginConfigSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixPluginConfig
+metadata:
+  name: test-plugin-config-secret
+spec:
+  ingressClassName: %s
+  plugins:
+  - name: response-rewrite
+    enable: true
+    secretRef: plugin-secret
+    config:
+      headers:
+        X-Secret-Ref: "true"
+`
+
+			const apisixRouteSpec = `
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: test-route-secret
+spec:
+  ingressClassName: %s
+  http:
+  - name: rule0
+    match:
+      paths:
+      - /*
+    backends:
+    - serviceName: httpbin-service-e2e-test
+      servicePort: 80
+    plugin_config_name: test-plugin-config-secret
+`
+
+			By("apply Secret")
+			err := s.CreateResourceFromString(secretSpec)
+			Expect(err).NotTo(HaveOccurred(), "creating Secret")
+
+			By("apply ApisixPluginConfig with SecretRef")
+			var apisixPluginConfig apiv2.ApisixPluginConfig
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-plugin-config-secret"},
+				&apisixPluginConfig, fmt.Sprintf(apisixPluginConfigSpec, s.Namespace()))
+
+			By("apply ApisixRoute that references ApisixPluginConfig")
+			var apisixRoute apiv2.ApisixRoute
+			applier.MustApplyAPIv2(types.NamespacedName{Namespace: s.Namespace(), Name: "test-route-secret"},
+				&apisixRoute, fmt.Sprintf(apisixRouteSpec, s.Namespace()))
+
+			By("verify ApisixRoute works with SecretRef")
+			s.RequestAssert(&scaffold.RequestAssert{
+				Method: "GET",
+				Path:   "/get",
+				Checks: []scaffold.ResponseCheckFunc{
+					scaffold.WithExpectedStatus(http.StatusOK),
+					scaffold.WithExpectedHeader("X-Secret-Ref", "true"),
+				},
+			})
+
+			By("delete resources")
+			err = s.DeleteResource("ApisixRoute", "test-route-secret")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixRoute")
+			err = s.DeleteResource("ApisixPluginConfig", "test-plugin-config-secret")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting ApisixPluginConfig")
+			err = s.DeleteResource("Secret", "plugin-secret")
+			Expect(err).ShouldNot(HaveOccurred(), "deleting Secret")
+		})
+	})
+})

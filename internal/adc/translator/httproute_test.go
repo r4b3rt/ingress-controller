@@ -1,0 +1,727 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package translator
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	adctypes "github.com/apache/apisix-ingress-controller/api/adc"
+	"github.com/apache/apisix-ingress-controller/api/v1alpha1"
+	apiv2 "github.com/apache/apisix-ingress-controller/api/v2"
+	"github.com/apache/apisix-ingress-controller/internal/controller/config"
+	"github.com/apache/apisix-ingress-controller/internal/provider"
+	internaltypes "github.com/apache/apisix-ingress-controller/internal/types"
+)
+
+func TestTranslateHTTPRouteServerPortVarsByMode(t *testing.T) {
+	pathMatchType := gatewayv1.PathMatchPathPrefix
+	pathValue := "/"
+
+	singlePortVars := adctypes.Vars{
+		{
+			{StrVal: "server_port"},
+			{StrVal: "=="},
+			{StrVal: "9080"},
+		},
+	}
+	multiPortVars := adctypes.Vars{
+		{
+			{StrVal: "server_port"},
+			{StrVal: "in"},
+			{SliceVal: []adctypes.StringOrSlice{
+				{StrVal: "9080"},
+				{StrVal: "9081"},
+			}},
+		},
+	}
+
+	tests := []struct {
+		name string
+		mode config.ListenerPortMatchMode
+		// explicit is the provenance-aware signal the controller stores on tctx
+		// (HasExplicitListenerMatch); the cross-Gateway sectionName/port
+		// resolution that computes it is covered by the controller tests.
+		explicit  bool
+		listeners []gatewayv1.Listener
+		expected  adctypes.Vars
+	}{
+		{
+			name: "auto mode: no injection for single listener without explicit target",
+			mode: config.ListenerPortMatchModeAuto,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9080)},
+			},
+			expected: nil,
+		},
+		{
+			name:     "auto mode: inject for explicit sectionName target",
+			mode:     config.ListenerPortMatchModeAuto,
+			explicit: true,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9080)},
+			},
+			expected: singlePortVars,
+		},
+		{
+			name: "auto mode: inject for multiple listener ports",
+			mode: config.ListenerPortMatchModeAuto,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9081)},
+				{Name: "http-alt", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9080)},
+			},
+			expected: multiPortVars,
+		},
+		{
+			name:     "explicit mode: inject for explicit target",
+			mode:     config.ListenerPortMatchModeExplicit,
+			explicit: true,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9080)},
+			},
+			expected: singlePortVars,
+		},
+		{
+			name: "explicit mode: no injection for multiple listener ports without explicit target",
+			mode: config.ListenerPortMatchModeExplicit,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9081)},
+				{Name: "http-alt", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9080)},
+			},
+			expected: nil,
+		},
+		{
+			name:     "off mode: no injection even with explicit target",
+			mode:     config.ListenerPortMatchModeOff,
+			explicit: true,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9080)},
+			},
+			expected: nil,
+		},
+		{
+			name: "off mode: no injection for multiple listener ports",
+			mode: config.ListenerPortMatchModeOff,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9081)},
+				{Name: "http-alt", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9080)},
+			},
+			expected: nil,
+		},
+		{
+			// An unset mode must not start injecting predicates behind the
+			// operator's back, so it resolves to off rather than to auto.
+			name:     "empty mode normalizes to off",
+			mode:     "",
+			explicit: true,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9080)},
+			},
+			expected: nil,
+		},
+		{
+			// Listeners sharing a port but differing by hostname are isolated by
+			// their hostname (service.hosts), not by port. Injecting a server_port
+			// var here adds no isolation and, worse, pins the route to the Gateway's
+			// declared port which need not equal APISIX's actual node_listen port,
+			// dropping every request to 404. So no server_port var must be emitted.
+			name:     "auto mode: no injection when explicit target listener has hostname",
+			mode:     config.ListenerPortMatchModeAuto,
+			explicit: true,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(80), Hostname: ptr.To(gatewayv1.Hostname("bar.com"))},
+			},
+			expected: nil,
+		},
+		{
+			name:     "auto mode: no injection for same-port listeners differing by hostname",
+			mode:     config.ListenerPortMatchModeAuto,
+			explicit: true,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(80), Hostname: ptr.To(gatewayv1.Hostname("bar.com"))},
+				{Name: "http-alt", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(80), Hostname: ptr.To(gatewayv1.Hostname("foo.bar.com"))},
+			},
+			expected: nil,
+		},
+		{
+			// A hostname-less sibling listener triggers a server_port var, but once
+			// emitted it must cover every targeted port - including the hostname
+			// listener's - or traffic arriving through the hostname listener is
+			// silently dropped. So the predicate lists both ports, not just 9080.
+			name:     "explicit mode: mixed hostname and hostname-less listeners keep every targeted port",
+			mode:     config.ListenerPortMatchModeExplicit,
+			explicit: true,
+			listeners: []gatewayv1.Listener{
+				{Name: "http-main", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(80), Hostname: ptr.To(gatewayv1.Hostname("bar.com"))},
+				{Name: "http-alt", Protocol: gatewayv1.HTTPProtocolType, Port: gatewayv1.PortNumber(9080)},
+			},
+			expected: adctypes.Vars{
+				{
+					{StrVal: "server_port"},
+					{StrVal: "in"},
+					{SliceVal: []adctypes.StringOrSlice{
+						{StrVal: "80"},
+						{StrVal: "9080"},
+					}},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tctx := provider.NewDefaultTranslateContext(context.Background())
+			tctx.HasExplicitListenerMatch = tt.explicit
+			tctx.Listeners = tt.listeners
+
+			httpRoute := &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "route",
+					Namespace: "default",
+				},
+				Spec: gatewayv1.HTTPRouteSpec{
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Matches: []gatewayv1.HTTPRouteMatch{
+								{
+									Path: &gatewayv1.HTTPPathMatch{
+										Type:  &pathMatchType,
+										Value: &pathValue,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			translator := NewTranslator(logr.Discard(), tt.mode)
+			got, err := translator.TranslateHTTPRoute(tctx, httpRoute)
+			assert.NoError(t, err)
+			if assert.Len(t, got.Services, 1) && assert.Len(t, got.Services[0].Routes, 1) {
+				// Every listener in this table is HTTP, so the route also carries the
+				// scheme predicate. TestTranslateHTTPRouteSchemeVar covers that on its own.
+				want := append(adctypes.Vars{{
+					{StrVal: "scheme"},
+					{StrVal: "=="},
+					{StrVal: "http"},
+				}}, tt.expected...)
+				assert.Equal(t, want, got.Services[0].Routes[0].Vars)
+			}
+		})
+	}
+}
+
+func TestTranslateHTTPRouteUpstreamScheme(t *testing.T) {
+	tests := []struct {
+		name         string
+		appProtocol  string
+		policyScheme string
+		wantScheme   string
+	}{
+		{
+			name:         "preserves backend traffic policy scheme",
+			appProtocol:  internaltypes.AppProtocolHTTP,
+			policyScheme: apiv2.SchemeHTTPS,
+			wantScheme:   apiv2.SchemeHTTPS,
+		},
+		{
+			name:        "falls back to app protocol when scheme is unset",
+			appProtocol: internaltypes.AppProtocolWSS,
+			wantScheme:  apiv2.SchemeHTTPS,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			translator := NewTranslator(logr.Discard(), "")
+			tctx := provider.NewDefaultTranslateContext(context.Background())
+
+			const (
+				namespace   = "default"
+				serviceName = "backend"
+				portName    = "web"
+				portNumber  = int32(8443)
+			)
+
+			serviceKey := types.NamespacedName{Namespace: namespace, Name: serviceName}
+			tctx.Services[serviceKey] = &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      serviceName,
+					Namespace: namespace,
+				},
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{{
+						Name:        portName,
+						Port:        portNumber,
+						AppProtocol: ptr.To(tt.appProtocol),
+					}},
+				},
+			}
+			tctx.EndpointSlices[serviceKey] = []discoveryv1.EndpointSlice{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "backend-1",
+					Namespace: namespace,
+				},
+				Ports: []discoveryv1.EndpointPort{{
+					Name: ptr.To(portName),
+					Port: ptr.To(portNumber),
+				}},
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses: []string{"10.0.0.1"},
+					Conditions: discoveryv1.EndpointConditions{
+						Ready: ptr.To(true),
+					},
+				}},
+			}}
+
+			if tt.policyScheme != "" {
+				tctx.BackendTrafficPolicies[serviceKey] = &v1alpha1.BackendTrafficPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "backend-policy",
+						Namespace: namespace,
+					},
+					Spec: v1alpha1.BackendTrafficPolicySpec{
+						TargetRefs: []v1alpha1.BackendPolicyTargetReferenceWithSectionName{{
+							LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+								Name: gatewayv1.ObjectName(serviceName),
+								Kind: gatewayv1.Kind(internaltypes.KindService),
+							},
+						}},
+						Scheme: tt.policyScheme,
+					},
+				}
+			}
+
+			route := &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "demo",
+					Namespace: namespace,
+				},
+				Spec: gatewayv1.HTTPRouteSpec{
+					Rules: []gatewayv1.HTTPRouteRule{{
+						BackendRefs: []gatewayv1.HTTPBackendRef{{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: gatewayv1.ObjectName(serviceName),
+									Port: ptr.To(portNumber),
+								},
+							},
+						}},
+					}},
+				},
+			}
+
+			result, err := translator.TranslateHTTPRoute(tctx, route)
+			require.NoError(t, err)
+			require.Len(t, result.Services, 1)
+			require.NotNil(t, result.Services[0].Upstream)
+
+			assert.Equal(t, tt.wantScheme, result.Services[0].Upstream.Scheme)
+			assert.Equal(t, "10.0.0.1", result.Services[0].Upstream.Nodes[0].Host)
+		})
+	}
+}
+
+func TestTranslateHTTPRouteExternalNameAppProtocol(t *testing.T) {
+	tests := []struct {
+		name          string
+		appProtocol   string
+		wantScheme    string
+		wantWebsocket *bool
+	}{
+		{
+			name:          "ExternalName with wss appProtocol",
+			appProtocol:   internaltypes.AppProtocolWSS,
+			wantScheme:    apiv2.SchemeHTTPS,
+			wantWebsocket: ptr.To(true),
+		},
+		{
+			name:          "ExternalName with ws appProtocol",
+			appProtocol:   internaltypes.AppProtocolWS,
+			wantScheme:    apiv2.SchemeHTTP,
+			wantWebsocket: ptr.To(true),
+		},
+		{
+			name:        "ExternalName with http appProtocol",
+			appProtocol: internaltypes.AppProtocolHTTP,
+			wantScheme:  apiv2.SchemeHTTP,
+		},
+		{
+			name:        "ExternalName without appProtocol",
+			appProtocol: "",
+			wantScheme:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			translator := NewTranslator(logr.Discard(), "")
+			tctx := provider.NewDefaultTranslateContext(context.Background())
+
+			const (
+				namespace   = "default"
+				serviceName = "external-backend"
+				portNumber  = 5000
+			)
+
+			var appProtocol *string
+			if tt.appProtocol != "" {
+				appProtocol = ptr.To(tt.appProtocol)
+			}
+
+			serviceKey := types.NamespacedName{Namespace: namespace, Name: serviceName}
+			tctx.Services[serviceKey] = &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      serviceName,
+					Namespace: namespace,
+				},
+				Spec: corev1.ServiceSpec{
+					Type:         corev1.ServiceTypeExternalName,
+					ExternalName: "example.com",
+					Ports: []corev1.ServicePort{{
+						Name:        "web",
+						Port:        portNumber,
+						AppProtocol: appProtocol,
+					}},
+				},
+			}
+
+			route := &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "demo",
+					Namespace: namespace,
+				},
+				Spec: gatewayv1.HTTPRouteSpec{
+					Rules: []gatewayv1.HTTPRouteRule{{
+						BackendRefs: []gatewayv1.HTTPBackendRef{{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: gatewayv1.ObjectName(serviceName),
+									Port: ptr.To(gatewayv1.PortNumber(portNumber)),
+								},
+							},
+						}},
+					}},
+				},
+			}
+
+			result, err := translator.TranslateHTTPRoute(tctx, route)
+			require.NoError(t, err)
+			require.Len(t, result.Services, 1)
+			require.NotNil(t, result.Services[0].Upstream)
+			require.Len(t, result.Services[0].Routes, 1)
+
+			assert.Equal(t, tt.wantScheme, result.Services[0].Upstream.Scheme)
+			assert.Equal(t, "example.com", result.Services[0].Upstream.Nodes[0].Host)
+			assert.Equal(t, tt.wantWebsocket, result.Services[0].Routes[0].EnableWebsocket)
+		})
+	}
+}
+
+func TestAttachBackendTrafficPolicyHealthCheck(t *testing.T) {
+	trueVal := true
+	falseVal := false
+
+	tests := []struct {
+		name       string
+		policy     *v1alpha1.BackendTrafficPolicy
+		wantChecks *adctypes.UpstreamHealthCheck
+	}{
+		{
+			name:       "nil health check produces no checks",
+			policy:     &v1alpha1.BackendTrafficPolicy{},
+			wantChecks: nil,
+		},
+		{
+			name: "active health check with all fields",
+			policy: &v1alpha1.BackendTrafficPolicy{
+				Spec: v1alpha1.BackendTrafficPolicySpec{
+					HealthCheck: &v1alpha1.HealthCheck{
+						Active: &v1alpha1.ActiveHealthCheck{
+							Type:           "http",
+							Timeout:        metav1.Duration{Duration: 3 * time.Second},
+							HTTPPath:       "/healthz",
+							Concurrency:    10,
+							Host:           "example.com",
+							Port:           8080,
+							StrictTLS:      &trueVal,
+							RequestHeaders: []string{"X-Custom: value"},
+							Healthy: &v1alpha1.ActiveHealthCheckHealthy{
+								Interval: metav1.Duration{Duration: 5 * time.Second},
+								PassiveHealthCheckHealthy: v1alpha1.PassiveHealthCheckHealthy{
+									HTTPCodes: []int{200, 201},
+									Successes: 3,
+								},
+							},
+							Unhealthy: &v1alpha1.ActiveHealthCheckUnhealthy{
+								Interval: metav1.Duration{Duration: 2 * time.Second},
+								PassiveHealthCheckUnhealthy: v1alpha1.PassiveHealthCheckUnhealthy{
+									HTTPCodes:    []int{500, 503},
+									HTTPFailures: 5,
+									TCPFailures:  2,
+									Timeouts:     3,
+								},
+							},
+						},
+					},
+				},
+			},
+			wantChecks: &adctypes.UpstreamHealthCheck{
+				Active: &adctypes.UpstreamActiveHealthCheck{
+					Type:                   "http",
+					Timeout:                3,
+					HTTPPath:               "/healthz",
+					Concurrency:            10,
+					Host:                   "example.com",
+					Port:                   8080,
+					HTTPSVerifyCertificate: true,
+					HTTPRequestHeaders:     []string{"X-Custom: value"},
+					Healthy: adctypes.UpstreamActiveHealthCheckHealthy{
+						Interval: 5,
+						UpstreamPassiveHealthCheckHealthy: adctypes.UpstreamPassiveHealthCheckHealthy{
+							HTTPStatuses: []int{200, 201},
+							Successes:    3,
+						},
+					},
+					Unhealthy: adctypes.UpstreamActiveHealthCheckUnhealthy{
+						Interval: 2,
+						UpstreamPassiveHealthCheckUnhealthy: adctypes.UpstreamPassiveHealthCheckUnhealthy{
+							HTTPStatuses: []int{500, 503},
+							HTTPFailures: 5,
+							TCPFailures:  2,
+							Timeouts:     3,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "strictTLS false disables certificate verification",
+			policy: &v1alpha1.BackendTrafficPolicy{
+				Spec: v1alpha1.BackendTrafficPolicySpec{
+					HealthCheck: &v1alpha1.HealthCheck{
+						Active: &v1alpha1.ActiveHealthCheck{
+							StrictTLS: &falseVal,
+							Healthy: &v1alpha1.ActiveHealthCheckHealthy{
+								Interval: metav1.Duration{Duration: 1 * time.Second},
+							},
+						},
+					},
+				},
+			},
+			wantChecks: &adctypes.UpstreamHealthCheck{
+				Active: &adctypes.UpstreamActiveHealthCheck{
+					Type:                   "http",
+					HTTPSVerifyCertificate: false,
+					Healthy: adctypes.UpstreamActiveHealthCheckHealthy{
+						Interval: 1,
+					},
+				},
+			},
+		},
+		{
+			name: "active and passive health checks together",
+			policy: &v1alpha1.BackendTrafficPolicy{
+				Spec: v1alpha1.BackendTrafficPolicySpec{
+					HealthCheck: &v1alpha1.HealthCheck{
+						Active: &v1alpha1.ActiveHealthCheck{
+							Type: "tcp",
+							Healthy: &v1alpha1.ActiveHealthCheckHealthy{
+								Interval: metav1.Duration{Duration: 1 * time.Second},
+							},
+						},
+						Passive: &v1alpha1.PassiveHealthCheck{
+							Type: "http",
+							Healthy: &v1alpha1.PassiveHealthCheckHealthy{
+								HTTPCodes: []int{200},
+								Successes: 2,
+							},
+							Unhealthy: &v1alpha1.PassiveHealthCheckUnhealthy{
+								HTTPCodes:    []int{500},
+								HTTPFailures: 3,
+							},
+						},
+					},
+				},
+			},
+			wantChecks: &adctypes.UpstreamHealthCheck{
+				Active: &adctypes.UpstreamActiveHealthCheck{
+					Type:                   "tcp",
+					HTTPSVerifyCertificate: true,
+					Healthy: adctypes.UpstreamActiveHealthCheckHealthy{
+						Interval: 1,
+					},
+				},
+				Passive: &adctypes.UpstreamPassiveHealthCheck{
+					Type: "http",
+					Healthy: adctypes.UpstreamPassiveHealthCheckHealthy{
+						HTTPStatuses: []int{200},
+						Successes:    2,
+					},
+					Unhealthy: adctypes.UpstreamPassiveHealthCheckUnhealthy{
+						HTTPStatuses: []int{500},
+						HTTPFailures: 3,
+					},
+				},
+			},
+		},
+	}
+
+	translator := &Translator{Log: logr.Discard()}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ups := adctypes.NewDefaultUpstream()
+			translator.attachBackendTrafficPolicyToUpstream(tt.policy, ups)
+			assert.Equal(t, tt.wantChecks, ups.Checks)
+		})
+	}
+}
+
+func TestAttachBackendTrafficPolicyToUpstreamSectionName(t *testing.T) {
+	const (
+		namespace   = "default"
+		serviceName = "backend"
+		webPort     = int32(80)
+		webName     = "web"
+		adminPort   = int32(9000)
+		adminName   = "admin"
+	)
+
+	serviceKey := types.NamespacedName{Namespace: namespace, Name: serviceName}
+	services := map[types.NamespacedName]*corev1.Service{
+		serviceKey: {
+			ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: namespace},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Name: webName, Port: webPort},
+					{Name: adminName, Port: adminPort},
+				},
+			},
+		},
+	}
+
+	newRef := func(port int32) gatewayv1.BackendRef {
+		return gatewayv1.BackendRef{
+			BackendObjectReference: gatewayv1.BackendObjectReference{
+				Name:      gatewayv1.ObjectName(serviceName),
+				Namespace: ptr.To(gatewayv1.Namespace(namespace)),
+				Port:      ptr.To(port),
+			},
+		}
+	}
+
+	newPolicy := func(name, sectionName, scheme string) *v1alpha1.BackendTrafficPolicy {
+		targetRef := v1alpha1.BackendPolicyTargetReferenceWithSectionName{
+			LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+				Name: gatewayv1.ObjectName(serviceName),
+				Kind: gatewayv1.Kind(internaltypes.KindService),
+			},
+		}
+		if sectionName != "" {
+			targetRef.SectionName = ptr.To(gatewayv1.SectionName(sectionName))
+		}
+		return &v1alpha1.BackendTrafficPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: v1alpha1.BackendTrafficPolicySpec{
+				TargetRefs: []v1alpha1.BackendPolicyTargetReferenceWithSectionName{targetRef},
+				Scheme:     scheme,
+			},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		ref        gatewayv1.BackendRef
+		policies   map[types.NamespacedName]*v1alpha1.BackendTrafficPolicy
+		wantScheme string
+	}{
+		{
+			name: "sectionName matches the backend port name",
+			ref:  newRef(webPort),
+			policies: map[types.NamespacedName]*v1alpha1.BackendTrafficPolicy{
+				{Namespace: namespace, Name: "p"}: newPolicy("p", webName, apiv2.SchemeHTTPS),
+			},
+			wantScheme: apiv2.SchemeHTTPS,
+		},
+		{
+			name: "sectionName does not match the backend port name",
+			ref:  newRef(adminPort),
+			policies: map[types.NamespacedName]*v1alpha1.BackendTrafficPolicy{
+				{Namespace: namespace, Name: "p"}: newPolicy("p", webName, apiv2.SchemeHTTPS),
+			},
+			wantScheme: "",
+		},
+		{
+			name: "no sectionName applies to the whole service",
+			ref:  newRef(adminPort),
+			policies: map[types.NamespacedName]*v1alpha1.BackendTrafficPolicy{
+				{Namespace: namespace, Name: "p"}: newPolicy("p", "", apiv2.SchemeHTTPS),
+			},
+			wantScheme: apiv2.SchemeHTTPS,
+		},
+		{
+			name: "port-specific policy takes precedence over whole-service policy",
+			ref:  newRef(adminPort),
+			policies: map[types.NamespacedName]*v1alpha1.BackendTrafficPolicy{
+				{Namespace: namespace, Name: "generic"}:  newPolicy("generic", "", apiv2.SchemeHTTP),
+				{Namespace: namespace, Name: "specific"}: newPolicy("specific", adminName, apiv2.SchemeHTTPS),
+			},
+			wantScheme: apiv2.SchemeHTTPS,
+		},
+		{
+			name: "targetRef kind mismatch does not attach to a same-named service",
+			ref:  newRef(webPort),
+			policies: map[types.NamespacedName]*v1alpha1.BackendTrafficPolicy{
+				{Namespace: namespace, Name: "p"}: {
+					ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: namespace},
+					Spec: v1alpha1.BackendTrafficPolicySpec{
+						TargetRefs: []v1alpha1.BackendPolicyTargetReferenceWithSectionName{{
+							LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+								Name: gatewayv1.ObjectName(serviceName),
+								Kind: gatewayv1.Kind("ServiceImport"),
+							},
+						}},
+						Scheme: apiv2.SchemeHTTPS,
+					},
+				},
+			},
+			wantScheme: "",
+		},
+	}
+
+	translator := NewTranslator(logr.Discard(), "")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := adctypes.NewDefaultUpstream()
+			translator.AttachBackendTrafficPolicyToUpstream(tt.ref, tt.policies, upstream, services)
+			assert.Equal(t, tt.wantScheme, upstream.Scheme)
+		})
+	}
+}

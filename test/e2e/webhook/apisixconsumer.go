@@ -1,0 +1,198 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package webhook
+
+import (
+	"fmt"
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"github.com/apache/apisix-ingress-controller/test/e2e/framework"
+	"github.com/apache/apisix-ingress-controller/test/e2e/scaffold"
+)
+
+var _ = Describe("Test ApisixConsumer Webhook", Label("webhook"), func() {
+	s := scaffold.NewScaffold(scaffold.Options{
+		Name:          "apisixconsumer-webhook-test",
+		EnableWebhook: true,
+	})
+
+	BeforeEach(func() {
+		By("creating GatewayProxy")
+		err := s.CreateResourceFromString(s.GetGatewayProxySpec())
+		Expect(err).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+		By("creating IngressClass")
+		err = s.CreateResourceFromStringWithNamespace(s.GetIngressClassYaml(), "")
+		Expect(err).NotTo(HaveOccurred(), "creating IngressClass")
+	})
+
+	It("should warn on missing authentication secrets", func() { //nolint:dupl
+		missingSecret := "missing-basic-secret"
+		consumerName := "webhook-apisixconsumer"
+		consumerYAML := `
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  ingressClassName: %s
+  authParameter:
+    basicAuth:
+      secretRef:
+        name: %s
+`
+
+		Eventually(func(g Gomega) {
+			output, err := s.CreateResourceFromStringAndGetOutput(fmt.Sprintf(consumerYAML, consumerName, s.Namespace(), s.Namespace(), missingSecret))
+			g.Expect(err).ShouldNot(HaveOccurred())
+			g.Expect(output).To(ContainSubstring(fmt.Sprintf("Warning: Referenced Secret '%s/%s' not found", s.Namespace(), missingSecret)))
+		}).WithTimeout(scaffold.DefaultTimeout).ProbeEvery(scaffold.DefaultInterval).Should(Succeed())
+
+		By("creating referenced secret")
+		secretYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+stringData:
+  username: demo
+  password: demo
+`, missingSecret)
+		err := s.CreateResourceFromString(secretYAML)
+		Expect(err).NotTo(HaveOccurred(), "creating basic auth secret")
+
+		Eventually(func(g Gomega) {
+			output, err := s.CreateResourceFromStringAndGetOutput(fmt.Sprintf(consumerYAML, consumerName, s.Namespace(), s.Namespace(), missingSecret))
+			g.Expect(err).ShouldNot(HaveOccurred())
+			g.Expect(output).NotTo(ContainSubstring(fmt.Sprintf("Warning: Referenced Secret '%s/%s' not found", s.Namespace(), missingSecret)))
+		}).WithTimeout(scaffold.DefaultTimeout).ProbeEvery(scaffold.DefaultInterval).Should(Succeed())
+	})
+
+	It("should reject invalid plugin config during ADC validation", func() {
+		privateKeyYAML := "          " + strings.ReplaceAll(framework.TestKey, "\n", "\n          ")
+
+		firstConsumer := fmt.Sprintf(`
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: webhook-apisixconsumer-a
+  namespace: %s
+spec:
+  ingressClassName: %s
+  authParameter:
+    keyAuth:
+      value:
+        key: consumer-a-key
+`, s.Namespace(), s.Namespace())
+
+		By("creating the first ApisixConsumer with valid key-auth config")
+		err := s.CreateResourceFromString(firstConsumer)
+		Expect(err).NotTo(HaveOccurred(), "creating first ApisixConsumer")
+
+		invalidConsumer := fmt.Sprintf(`
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: webhook-apisixconsumer-b
+  namespace: %s
+spec:
+  ingressClassName: %s
+  authParameter:
+    jwtAuth:
+      value:
+        key: consumer-b-key
+        algorithm: INVALID_ALGO
+        private_key: |
+%s
+`, s.Namespace(), s.Namespace(), privateKeyYAML)
+
+		By("creating ApisixConsumer with an invalid jwt-auth algorithm")
+		err = s.CreateResourceFromString(invalidConsumer)
+		expectAdmissionDenied(s, "apisixconsumer", "webhook-apisixconsumer-b", err)
+
+		correctedConsumer := fmt.Sprintf(`
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: webhook-apisixconsumer-b
+  namespace: %s
+spec:
+  ingressClassName: %s
+  authParameter:
+    keyAuth:
+      value:
+        key: consumer-b-corrected-key
+`, s.Namespace(), s.Namespace())
+
+		By("creating corrected ApisixConsumer with valid auth config")
+		err = s.CreateResourceFromString(correctedConsumer)
+		Expect(err).NotTo(HaveOccurred(), "creating corrected ApisixConsumer")
+	})
+
+	It("should reject consumer update that fails ADC validation", func() {
+		consumerName := "webhook-apisixconsumer-update"
+
+		validConsumer := fmt.Sprintf(`
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  ingressClassName: %s
+  authParameter:
+    keyAuth:
+      value:
+        key: update-test-key
+`, consumerName, s.Namespace(), s.Namespace())
+
+		By("creating valid ApisixConsumer")
+		err := s.CreateResourceFromString(validConsumer)
+		Expect(err).NotTo(HaveOccurred(), "creating initial valid ApisixConsumer")
+
+		privateKeyYAML := "          " + strings.ReplaceAll(framework.TestKey, "\n", "\n          ")
+		invalidConsumer := fmt.Sprintf(`
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  ingressClassName: %s
+  authParameter:
+    jwtAuth:
+      value:
+        key: update-test-jwt-key
+        algorithm: INVALID_ALGO
+        private_key: |
+%s
+`, consumerName, s.Namespace(), s.Namespace(), privateKeyYAML)
+
+		By("updating ApisixConsumer with invalid jwt-auth algorithm")
+		err = s.CreateResourceFromString(invalidConsumer)
+		expectUpdateDenied(err)
+
+		By("updating ApisixConsumer with corrected config")
+		err = s.CreateResourceFromString(validConsumer)
+		Expect(err).NotTo(HaveOccurred(), "updating ApisixConsumer with corrected config")
+	})
+})

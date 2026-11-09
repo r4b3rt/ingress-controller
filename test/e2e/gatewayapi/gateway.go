@@ -1,0 +1,1013 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package gatewayapi
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/apache/apisix-ingress-controller/test/e2e/framework"
+	"github.com/apache/apisix-ingress-controller/test/e2e/scaffold"
+)
+
+const _secretName = "test-apisix-tls"
+
+const _hostAPI6 = "api6.com"
+
+var Cert = strings.TrimSpace(framework.TestServerCert)
+
+var Key = strings.TrimSpace(framework.TestServerKey)
+
+func createSecret(s *scaffold.Scaffold, secretName string) {
+	err := s.NewKubeTlsSecret(secretName, Cert, Key)
+	assert.Nil(GinkgoT(), err, "create secret error")
+}
+
+// indentLines indents every line of s with the given prefix, for embedding a
+// multi-line PEM block inside a YAML block scalar.
+func indentLines(s, prefix string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = prefix + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+var _ = Describe("Test Gateway", Label("networking.k8s.io", "gateway"), func() {
+	s := scaffold.NewDefaultScaffold()
+
+	var gatewayProxyYaml = `
+apiVersion: apisix.apache.org/v1alpha1
+kind: GatewayProxy
+metadata:
+  name: apisix-proxy-config
+  namespace: %s
+spec:
+  provider:
+    type: ControlPlane
+    controlPlane:
+      endpoints:
+      - %s
+      auth:
+        type: AdminKey
+        adminKey:
+          value: "%s"
+`
+
+	Context("Gateway", func() {
+		var defaultGatewayClass = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: %s
+spec:
+  controllerName: "%s"
+`
+
+		var defaultGateway = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: %s
+spec:
+  gatewayClassName: %s
+  listeners:
+    - name: http1
+      protocol: HTTP
+      port: 80
+  infrastructure:
+    parametersRef:
+      group: apisix.apache.org
+      kind: GatewayProxy
+      name: apisix-proxy-config
+`
+
+		var noClassGateway = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: apisix-not-class
+spec:
+  gatewayClassName: apisix-not-exist
+  listeners:
+    - name: http1
+      protocol: HTTP
+      port: 80
+  infrastructure:
+    parametersRef:
+      group: apisix.apache.org
+      kind: GatewayProxy
+      name: apisix-proxy-config
+`
+
+		It("Create Gateway", func() {
+			gatewayClassName := s.Namespace()
+			By("create GatewayProxy")
+			gatewayProxy := fmt.Sprintf(gatewayProxyYaml, s.Namespace(), s.Deployer.GetAdminEndpoint(), s.AdminKey())
+			err := s.CreateResourceFromString(gatewayProxy)
+			Expect(err).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+			By("create GatewayClass")
+			err = s.CreateResourceFromStringWithNamespace(fmt.Sprintf(defaultGatewayClass, gatewayClassName, s.GetControllerName()), "")
+			Expect(err).NotTo(HaveOccurred(), "creating GatewayClass")
+
+			By("check GatewayClass condition")
+			s.RetryAssertion(func() (string, error) {
+				return s.GetResourceYaml("GatewayClass", gatewayClassName)
+			}).Should(And(
+				ContainSubstring(`status: "True"`),
+				ContainSubstring("message: the gatewayclass has been accepted by the apisix-ingress-controller"),
+			), "checking GatewayClass condition")
+
+			By("create Gateway")
+			gatewayName := s.Namespace()
+			err = s.CreateResourceFromStringWithNamespace(fmt.Sprintf(defaultGateway, gatewayName, gatewayClassName), s.
+				Namespace())
+			Expect(err).NotTo(HaveOccurred(), "creating Gateway")
+
+			By("check Gateway condition")
+			s.RetryAssertion(func() (string, error) {
+				return s.GetResourceYaml("Gateway", gatewayName)
+			}).Should(And(
+				ContainSubstring(`status: "True"`),
+				ContainSubstring("message: the gateway has been accepted by the apisix-ingress-controller"),
+			), "checking Gateway condition")
+
+			By("create Gateway with not accepted GatewayClass")
+			err = s.CreateResourceFromStringWithNamespace(noClassGateway, s.Namespace())
+			Expect(err).NotTo(HaveOccurred(), "creating Gateway")
+
+			By("check Gateway condition")
+			s.RetryAssertion(func() (string, error) {
+				return s.GetResourceYaml("Gateway", "apisix-not-class")
+			}).Should(ContainSubstring(`status: Unknown`), "checking Gateway condition status")
+		})
+	})
+
+	Context("Gateway SSL", func() {
+		It("Check if SSL resource was created", func() {
+			By("create GatewayProxy")
+			gatewayProxy := fmt.Sprintf(gatewayProxyYaml, s.Namespace(), s.Deployer.GetAdminEndpoint(), s.AdminKey())
+			err := s.CreateResourceFromString(gatewayProxy)
+			Expect(err).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+			By("create secret")
+			secretName := _secretName
+			host := _hostAPI6
+			createSecret(s, secretName)
+			gatewayClassName := s.Namespace()
+			var defaultGatewayClass = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: %s
+spec:
+  controllerName: "%s"
+`
+
+			var defaultGateway = fmt.Sprintf(`
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: %s
+spec:
+  gatewayClassName: %s
+  listeners:
+    - name: http1
+      protocol: HTTPS
+      port: 443
+      hostname: %s
+      tls:
+        certificateRefs:
+        - kind: Secret
+          group: ""
+          name: %s
+  infrastructure:
+    parametersRef:
+      group: apisix.apache.org
+      kind: GatewayProxy
+      name: apisix-proxy-config
+`, s.Namespace(), gatewayClassName, host, secretName)
+			By("create GatewayClass")
+			err = s.CreateResourceFromStringWithNamespace(fmt.Sprintf(defaultGatewayClass, gatewayClassName, s.GetControllerName()), "")
+			Expect(err).NotTo(HaveOccurred(), "creating GatewayClass")
+
+			By("create Gateway")
+			err = s.CreateResourceFromStringWithNamespace(defaultGateway, s.Namespace())
+			Expect(err).NotTo(HaveOccurred(), "creating Gateway")
+
+			Eventually(func(g Gomega) {
+				tls, err := s.DefaultDataplaneResource().SSL().List(context.Background())
+				g.Expect(err).NotTo(HaveOccurred(), "list tls error")
+				g.Expect(tls).To(HaveLen(1), "tls number not expect")
+				g.Expect(tls[0].Certificates).To(HaveLen(1), "length of certificates not expect")
+				g.Expect(tls[0].Certificates[0].Certificate).To(Equal(Cert), "tls cert not expect")
+				g.Expect(tls[0].Snis).To(ConsistOf(host))
+			}).WithTimeout(scaffold.DefaultTimeout).ProbeEvery(scaffold.DefaultInterval).Should(Succeed())
+		})
+
+		It("Check downstream mTLS via frontendValidation", func() {
+			By("create GatewayProxy")
+			gatewayProxy := fmt.Sprintf(gatewayProxyYaml, s.Namespace(), s.Deployer.GetAdminEndpoint(), s.AdminKey())
+			err := s.CreateResourceFromString(gatewayProxy)
+			Expect(err).NotTo(HaveOccurred(), "creating GatewayProxy")
+			time.Sleep(5 * time.Second)
+
+			By("create server cert secret")
+			secretName := _secretName
+			host := _hostAPI6
+			createSecret(s, secretName)
+
+			By("create CA ConfigMap for frontendValidation")
+			caConfigMapName := "test-client-ca"
+			caConfigMap := fmt.Sprintf(`
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: %s
+data:
+  ca.crt: |
+%s
+`, caConfigMapName, indentLines(framework.TestCACert, "    "))
+			err = s.CreateResourceFromString(caConfigMap)
+			Expect(err).NotTo(HaveOccurred(), "creating CA ConfigMap")
+
+			gatewayClassName := s.Namespace()
+			var defaultGatewayClass = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: %s
+spec:
+  controllerName: "%s"
+`
+			// Gateway API v1.6 moved frontendValidation from the listener TLS config
+			// to the Gateway-level spec.tls.frontend.
+			var defaultGateway = fmt.Sprintf(`
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: %s
+spec:
+  gatewayClassName: %s
+  tls:
+    frontend:
+      default:
+        validation:
+          caCertificateRefs:
+          - kind: ConfigMap
+            group: ""
+            name: %s
+  listeners:
+    - name: http1
+      protocol: HTTPS
+      port: 443
+      hostname: %s
+      tls:
+        certificateRefs:
+        - kind: Secret
+          group: ""
+          name: %s
+  infrastructure:
+    parametersRef:
+      group: apisix.apache.org
+      kind: GatewayProxy
+      name: apisix-proxy-config
+`, s.Namespace(), gatewayClassName, caConfigMapName, host, secretName)
+
+			By("create GatewayClass")
+			err = s.CreateResourceFromStringWithNamespace(fmt.Sprintf(defaultGatewayClass, gatewayClassName, s.GetControllerName()), "")
+			Expect(err).NotTo(HaveOccurred(), "creating GatewayClass")
+			time.Sleep(5 * time.Second)
+
+			By("create Gateway")
+			err = s.CreateResourceFromStringWithNamespace(defaultGateway, s.Namespace())
+			Expect(err).NotTo(HaveOccurred(), "creating Gateway")
+			time.Sleep(10 * time.Second)
+
+			Eventually(func() error {
+				tls, err := s.DefaultDataplaneResource().SSL().List(context.Background())
+				if err != nil {
+					return err
+				}
+				if len(tls) != 1 {
+					return fmt.Errorf("expect 1 ssl, got %d", len(tls))
+				}
+				if tls[0].Client == nil {
+					return fmt.Errorf("expect client mTLS config, got nil")
+				}
+				if got := strings.TrimSpace(tls[0].Client.CA); got != strings.TrimSpace(framework.TestCACert) {
+					return fmt.Errorf("client CA not expected, got %s", got)
+				}
+				return nil
+			}).WithTimeout(30 * time.Second).ProbeEvery(time.Second).Should(Succeed())
+		})
+
+		It("Gateway SSL with and without hostname", func() {
+			By("create GatewayProxy")
+			gatewayProxy := fmt.Sprintf(gatewayProxyYaml, s.Namespace(), s.Deployer.GetAdminEndpoint(), s.AdminKey())
+			err := s.CreateResourceFromString(gatewayProxy)
+			Expect(err).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+			secretName := _secretName
+			createSecret(s, secretName)
+			gatewayClassName := s.Namespace()
+			var defaultGatewayClass = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: %s
+spec:
+  controllerName: "%s"
+`
+
+			var defaultGateway = fmt.Sprintf(`
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: same-namespace-with-https-listener
+spec:
+  gatewayClassName: %s
+  listeners:
+  - name: https
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: Same
+    tls:
+      certificateRefs:
+      - group: ""
+        kind: Secret
+        name: %s
+  - name: https-with-hostname
+    port: 443
+    hostname: api6.com
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: Same
+    tls:
+      certificateRefs:
+      - group: ""
+        kind: Secret
+        name: %s
+  infrastructure:
+    parametersRef:
+      group: apisix.apache.org
+      kind: GatewayProxy
+      name: apisix-proxy-config
+`, gatewayClassName, secretName, secretName)
+			By("create GatewayClass")
+			err = s.CreateResourceFromStringWithNamespace(fmt.Sprintf(defaultGatewayClass, gatewayClassName, s.GetControllerName()), "")
+			Expect(err).NotTo(HaveOccurred(), "creating GatewayClass")
+
+			By("create Gateway")
+			err = s.CreateResourceFromStringWithNamespace(defaultGateway, s.Namespace())
+			Expect(err).NotTo(HaveOccurred(), "creating Gateway")
+
+			Eventually(func() error {
+				tls, err := s.DefaultDataplaneResource().SSL().List(context.Background())
+				Expect(err).NotTo(HaveOccurred(), "list ssl")
+				if len(tls) != 2 {
+					return fmt.Errorf("expect 2 ssl, got %d", len(tls))
+				}
+				if len(tls[0].Certificates) != 1 {
+					return fmt.Errorf("expect 1 certificate, got %d", len(tls[0].Certificates))
+				}
+				if Cert != tls[0].Certificates[0].Certificate {
+					return fmt.Errorf("expect cert %s, got %s", Cert, tls[0].Certificates[0].Certificate)
+				}
+				if s.GetControllerName() != tls[0].Labels["k8s/controller-name"] {
+					return fmt.Errorf("expect controller name %s, got %s", s.GetControllerName(), tls[0].Labels["k8s/controller-name"])
+				}
+				return nil
+			}).WithTimeout(20 * time.Second).ProbeEvery(time.Second).ShouldNot(HaveOccurred())
+
+			By("update secret")
+			err = s.NewKubeTlsSecret(secretName, framework.TestCert, framework.TestKey)
+			Expect(err).NotTo(HaveOccurred(), "update secret")
+			Eventually(func() string {
+				tls, err := s.DefaultDataplaneResource().SSL().List(context.Background())
+				Expect(err).NotTo(HaveOccurred(), "list ssl")
+				if len(tls) != 2 {
+					return ""
+				}
+				if len(tls[0].Certificates) < 1 {
+					return ""
+				}
+				return tls[0].Certificates[0].Certificate
+			}).WithTimeout(20 * time.Second).ProbeEvery(time.Second).Should(Equal(framework.TestCert))
+		})
+	})
+
+	Context("Gateway Status", func() {
+		var gatewaySpec = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: %s
+spec:
+  gatewayClassName: %s
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+  - name: tcp
+    protocol: TCP
+    port: 9000
+    allowedRoutes:
+      kinds:
+      - kind: TCPRoute
+  - name: udp
+    protocol: UDP
+    port: 80
+    allowedRoutes:
+      kinds:
+      - kind: UDPRoute
+  infrastructure:
+    parametersRef:
+      group: apisix.apache.org
+      kind: GatewayProxy
+      name: apisix-proxy-config
+`
+		var httprouteSpec = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: %s
+spec:
+  parentRefs:
+  - name: %s
+  hostnames:
+  - httpbin.org
+  rules:
+  - matches: 
+    - path:
+        type: Exact
+        value: /get
+    backendRefs:
+    - name: httpbin-service-e2e-test
+      port: 80
+`
+		var grpcrouteSpec = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: %s
+spec:
+  parentRefs:
+  - name: %s
+  rules:
+  - backendRefs:
+    - name: grpc-infra-backend-v1
+      port: 8080
+`
+		var tcpRouteSpec = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata:
+  name: %s
+spec:
+  parentRefs:
+  - name: %s
+    sectionName: tcp
+  rules:
+  - backendRefs:
+    - name: httpbin-service-e2e-test
+      port: 80
+`
+		var udpRoute = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata:
+  name: %s
+spec:
+  parentRefs:
+  - name: %s
+    sectionName: udp
+  rules:
+  - backendRefs:
+    - name: %s
+      port: %d
+`
+		var (
+			dnsName string
+			dnsPort int32
+		)
+
+		BeforeEach(func() {
+			dnsSvc := s.NewCoreDNSService()
+			dnsName = dnsSvc.Name
+			dnsPort = dnsSvc.Spec.Ports[0].Port
+
+			By("deploy grpc backend")
+			s.DeployGRPCBackend()
+
+			By("create GatewayProxy")
+			Expect(s.CreateResourceFromString(s.GetGatewayProxySpec())).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+			By("create GatewayClass")
+			Expect(s.CreateResourceFromString(s.GetGatewayClassYaml())).NotTo(HaveOccurred(), "creating GatewayClass")
+
+			s.RetryAssertion(func() string {
+				gcyaml, _ := s.GetResourceYaml("GatewayClass", s.Namespace())
+				return gcyaml
+			}).Should(
+				And(
+					ContainSubstring(`status: "True"`),
+					ContainSubstring("message: the gatewayclass has been accepted by the apisix-ingress-controller"),
+				),
+				"check GatewayClass condition",
+			)
+
+			By("create Gateway")
+			gateway := fmt.Sprintf(gatewaySpec, s.Namespace(), s.Namespace())
+			Expect(s.CreateResourceFromString(gateway)).NotTo(HaveOccurred(), "creating Gateway")
+
+			s.RetryAssertion(func() string {
+				gcyaml, _ := s.GetResourceYaml("Gateway", s.Namespace())
+				return gcyaml
+			}).Should(
+				And(
+					ContainSubstring(`status: "True"`),
+					ContainSubstring("message: the gateway has been accepted by the apisix-ingress-controller"),
+				),
+				"check Gateway condition status",
+			)
+		})
+		getStatusLintener := func(listenerName string) (*gatewayv1.ListenerStatus, error) {
+			var gateway gatewayv1.Gateway
+			if err := s.GetKubeClient().Get(context.Background(), k8stypes.NamespacedName{
+				Name:      s.Namespace(),
+				Namespace: s.Namespace(),
+			}, &gateway); err != nil {
+				return nil, err
+			}
+			for _, listener := range gateway.Status.Listeners {
+				if string(listener.Name) == listenerName {
+					return &listener, nil
+				}
+			}
+			return nil, fmt.Errorf("listener %s not found", listenerName)
+		}
+		expectListenerAttachedRoutes := func(listenerName string, accectedRoutes int) {
+			s.RetryAssertion(func() error {
+				listener, err := getStatusLintener(listenerName)
+				if err != nil {
+					return err
+				}
+				if listener.AttachedRoutes != int32(accectedRoutes) {
+					return fmt.Errorf("expected listener %s attached routes to be %d, got %d", listener.Name, accectedRoutes, listener.AttachedRoutes)
+				}
+				return nil
+			}).ShouldNot(HaveOccurred(), "check listener attached routes")
+		}
+		It("check attachedRoutes and supportedkinds to gateway status", func() {
+			By("check HTTPRoute/GRPCRoute attachedRoutes and supportedkinds to gateway status")
+			s.ResourceApplied("HTTPRoute", "httpbin", fmt.Sprintf(httprouteSpec, "httpbin", s.Namespace()), 1)
+			expectListenerAttachedRoutes("http", 1)
+			for i := 0; i < 10; i++ {
+				name := fmt.Sprintf("httpbin-%d", i)
+				s.ResourceApplied("HTTPRoute", name, fmt.Sprintf(httprouteSpec, name, s.Namespace()), 1)
+			}
+			expectListenerAttachedRoutes("http", 11)
+			for i := 0; i < 10; i++ {
+				name := fmt.Sprintf("grcproute-%d", i)
+				s.ResourceApplied("GRPCRoute", name, fmt.Sprintf(grpcrouteSpec, name, s.Namespace()), 1)
+			}
+			expectListenerAttachedRoutes("http", 21)
+
+			listenner, err := getStatusLintener("http")
+			Expect(err).NotTo(HaveOccurred(), "get http listener status")
+			Expect(listenner.SupportedKinds).To(HaveLen(2), "http listener supported kinds length")
+			Expect(listenner.SupportedKinds).To(ContainElements(
+				gatewayv1.RouteGroupKind{
+					Group: ptr.To(gatewayv1.Group(gatewayv1.GroupName)),
+					Kind:  "HTTPRoute",
+				},
+				gatewayv1.RouteGroupKind{
+					Group: ptr.To(gatewayv1.Group(gatewayv1.GroupName)),
+					Kind:  "GRPCRoute",
+				},
+			), "http listener supported kinds content")
+
+			By("check TCPRoute attachedRoutes and supportedkinds to gateway status")
+			name := "tcp-route"
+			s.ResourceApplied("TCPRoute", name, fmt.Sprintf(tcpRouteSpec, name, s.Namespace()), 1)
+			expectListenerAttachedRoutes("tcp", 1)
+			for i := 0; i < 10; i++ {
+				name := fmt.Sprintf("tcp-route-%d", i)
+				s.ResourceApplied("TCPRoute", name, fmt.Sprintf(tcpRouteSpec, name, s.Namespace()), 1)
+			}
+			expectListenerAttachedRoutes("tcp", 11)
+			getListener, err := getStatusLintener("tcp")
+			Expect(err).NotTo(HaveOccurred(), "get tcp listener status")
+			Expect(getListener.SupportedKinds).To(HaveLen(1), "tcp listener supported kinds length")
+			Expect(string(getListener.SupportedKinds[0].Kind)).To(Equal("TCPRoute"), "tcp listener supported kind content")
+
+			By("check UDPRoute attachedRoutes and supportedkinds to gateway status")
+			name = "udp-route"
+			s.ResourceApplied("UDPRoute", name, fmt.Sprintf(udpRoute, name, s.Namespace(), dnsName, dnsPort), 1)
+			expectListenerAttachedRoutes("udp", 1)
+			for i := 0; i < 10; i++ {
+				name := fmt.Sprintf("udp-route-%d", i)
+				s.ResourceApplied("UDPRoute", name, fmt.Sprintf(udpRoute, name, s.Namespace(), dnsName, dnsPort), 1)
+			}
+			expectListenerAttachedRoutes("udp", 11)
+			getListener, err = getStatusLintener("udp")
+			Expect(err).NotTo(HaveOccurred(), "get udp listener status")
+			Expect(getListener.SupportedKinds).To(HaveLen(1), "udp listener supported kinds length")
+			Expect(string(getListener.SupportedKinds[0].Kind)).To(Equal("UDPRoute"), "udp listener supported kind content")
+		})
+	})
+
+	Context("Gateway Status Address", func() {
+		var gatewayProxyWithStatusAddressYaml = `
+apiVersion: apisix.apache.org/v1alpha1
+kind: GatewayProxy
+metadata:
+  name: apisix-proxy-config
+  namespace: %s
+spec:
+  statusAddress:
+  - %s
+  provider:
+    type: ControlPlane
+    controlPlane:
+      endpoints:
+      - %s
+      auth:
+        type: AdminKey
+        adminKey:
+          value: "%s"
+`
+		var defaultGatewayClass = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: %s
+spec:
+  controllerName: "%s"
+`
+		var defaultGateway = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: %s
+spec:
+  gatewayClassName: %s
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+  infrastructure:
+    parametersRef:
+      group: apisix.apache.org
+      kind: GatewayProxy
+      name: apisix-proxy-config
+`
+		getGatewayAddresses := func(gatewayName string) ([]gatewayv1.GatewayStatusAddress, error) {
+			var gateway gatewayv1.Gateway
+			if err := s.GetKubeClient().Get(context.Background(), k8stypes.NamespacedName{
+				Name:      gatewayName,
+				Namespace: s.Namespace(),
+			}, &gateway); err != nil {
+				return nil, err
+			}
+			return gateway.Status.Addresses, nil
+		}
+
+		assertGatewayAddress := func(gatewayName, expectedValue string, expectedType gatewayv1.AddressType) {
+			s.RetryAssertion(func() error {
+				addrs, err := getGatewayAddresses(gatewayName)
+				if err != nil {
+					return err
+				}
+				if len(addrs) == 0 {
+					return fmt.Errorf("expected at least 1 status address, got 0")
+				}
+				addr := addrs[0]
+				if addr.Value != expectedValue {
+					return fmt.Errorf("expected address value %s, got %s", expectedValue, addr.Value)
+				}
+				if addr.Type == nil {
+					return fmt.Errorf("expected address type to be set, got nil")
+				}
+				if *addr.Type != expectedType {
+					return fmt.Errorf("expected address type %s, got %s", expectedType, *addr.Type)
+				}
+				return nil
+			}).ShouldNot(HaveOccurred(), "check Gateway status address")
+		}
+
+		createGatewayClassAndGateway := func(gatewayClassName, gatewayName string) {
+			By("create GatewayClass")
+			Expect(s.CreateResourceFromStringWithNamespace(
+				fmt.Sprintf(defaultGatewayClass, gatewayClassName, s.GetControllerName()), ""),
+			).NotTo(HaveOccurred(), "creating GatewayClass")
+
+			By("create Gateway")
+			Expect(s.CreateResourceFromStringWithNamespace(
+				fmt.Sprintf(defaultGateway, gatewayName, gatewayClassName), s.Namespace()),
+			).NotTo(HaveOccurred(), "creating Gateway")
+		}
+
+		checkGatewayStatusAddressType := func(addrValue string, expectedType gatewayv1.AddressType) {
+			gatewayClassName := s.Namespace()
+
+			By("create GatewayProxy with statusAddress")
+			gatewayProxy := fmt.Sprintf(gatewayProxyWithStatusAddressYaml,
+				s.Namespace(), addrValue, s.Deployer.GetAdminEndpoint(), s.AdminKey())
+			Expect(s.CreateResourceFromString(gatewayProxy)).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+			gatewayName := s.Namespace()
+			createGatewayClassAndGateway(gatewayClassName, gatewayName)
+
+			By("check Gateway status address type")
+			assertGatewayAddress(gatewayName, addrValue, expectedType)
+		}
+
+		It("sets IPAddress type when statusAddress is an IP", func() {
+			checkGatewayStatusAddressType("192.168.1.100", gatewayv1.IPAddressType)
+		})
+
+		It("sets Hostname type when statusAddress is a hostname", func() {
+			checkGatewayStatusAddressType("mygateway.example.com", gatewayv1.HostnameAddressType)
+		})
+
+		It("deduplicates repeated statusAddress entries", func() {
+			gatewayClassName := s.Namespace()
+			gatewayName := s.Namespace()
+			addr := "192.168.1.100"
+
+			By("create GatewayProxy with the same IP listed twice in statusAddress")
+			gatewayProxy := fmt.Sprintf(`
+apiVersion: apisix.apache.org/v1alpha1
+kind: GatewayProxy
+metadata:
+  name: apisix-proxy-config
+  namespace: %s
+spec:
+  statusAddress:
+  - %s
+  - %s
+  provider:
+    type: ControlPlane
+    controlPlane:
+      endpoints:
+      - %s
+      auth:
+        type: AdminKey
+        adminKey:
+          value: "%s"
+`, s.Namespace(), addr, addr, s.Deployer.GetAdminEndpoint(), s.AdminKey())
+			Expect(s.CreateResourceFromString(gatewayProxy)).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+			createGatewayClassAndGateway(gatewayClassName, gatewayName)
+
+			By("verify only one address appears in Gateway status despite duplicate input")
+			s.RetryAssertion(func() error {
+				addrs, err := getGatewayAddresses(gatewayName)
+				if err != nil {
+					return err
+				}
+				if len(addrs) != 1 {
+					return fmt.Errorf("expected exactly 1 status address after dedup, got %d", len(addrs))
+				}
+				if addrs[0].Value != addr {
+					return fmt.Errorf("expected address value %s, got %s", addr, addrs[0].Value)
+				}
+				return nil
+			}).ShouldNot(HaveOccurred(), "check Gateway status address deduplication")
+		})
+
+		It("updates status when statusAddress value changes without count change", func() {
+			gatewayClassName := s.Namespace()
+			gatewayName := s.Namespace()
+			initialAddr := "192.168.1.100"
+			updatedAddr := "updated.example.com"
+
+			By("create GatewayProxy with initial statusAddress")
+			gatewayProxy := fmt.Sprintf(gatewayProxyWithStatusAddressYaml,
+				s.Namespace(), initialAddr, s.Deployer.GetAdminEndpoint(), s.AdminKey())
+			Expect(s.CreateResourceFromString(gatewayProxy)).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+			createGatewayClassAndGateway(gatewayClassName, gatewayName)
+
+			By("verify initial status address is set")
+			assertGatewayAddress(gatewayName, initialAddr, gatewayv1.IPAddressType)
+
+			By("update GatewayProxy with different statusAddress (same count)")
+			updatedGatewayProxy := fmt.Sprintf(gatewayProxyWithStatusAddressYaml,
+				s.Namespace(), updatedAddr, s.Deployer.GetAdminEndpoint(), s.AdminKey())
+			Expect(s.CreateResourceFromString(updatedGatewayProxy)).NotTo(HaveOccurred(), "updating GatewayProxy")
+
+			By("verify status address is updated to new value and type")
+			assertGatewayAddress(gatewayName, updatedAddr, gatewayv1.HostnameAddressType)
+		})
+	})
+
+	Context("Gateway Status Address from publishService", func() {
+		var gatewayProxyWithPublishServiceYaml = `
+apiVersion: apisix.apache.org/v1alpha1
+kind: GatewayProxy
+metadata:
+  name: apisix-proxy-config
+  namespace: %s
+spec:
+  publishService: %s/%s
+  provider:
+    type: ControlPlane
+    controlPlane:
+      endpoints:
+      - %s
+      auth:
+        type: AdminKey
+        adminKey:
+          value: "%s"
+`
+		var defaultGatewayClass = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: %s
+spec:
+  controllerName: "%s"
+`
+		var defaultGateway = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: %s
+spec:
+  gatewayClassName: %s
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+  infrastructure:
+    parametersRef:
+      group: apisix.apache.org
+      kind: GatewayProxy
+      name: apisix-proxy-config
+`
+		const publishServiceName = "apisix-publish-svc"
+
+		// createPublishService creates a LoadBalancer Service and, because kind has
+		// no cloud provider to do it, writes the external address into its status.
+		createPublishService := func(lbIngress ...corev1.LoadBalancerIngress) {
+			svcYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  type: LoadBalancer
+  selector:
+    app: httpbin
+  ports:
+  - port: 80
+    targetPort: 80
+`, publishServiceName, s.Namespace())
+			Expect(s.CreateResourceFromStringWithNamespace(svcYaml, s.Namespace())).
+				NotTo(HaveOccurred(), "creating publish Service")
+			setPublishServiceAddress(s, publishServiceName, lbIngress...)
+		}
+
+		createGatewayClassAndGateway := func(gatewayClassName, gatewayName string) {
+			By("create GatewayClass")
+			Expect(s.CreateResourceFromStringWithNamespace(
+				fmt.Sprintf(defaultGatewayClass, gatewayClassName, s.GetControllerName()), ""),
+			).NotTo(HaveOccurred(), "creating GatewayClass")
+
+			By("create Gateway")
+			Expect(s.CreateResourceFromStringWithNamespace(
+				fmt.Sprintf(defaultGateway, gatewayName, gatewayClassName), s.Namespace()),
+			).NotTo(HaveOccurred(), "creating Gateway")
+		}
+
+		assertGatewayAddresses := func(gatewayName string, expected ...gatewayv1.GatewayStatusAddress) {
+			s.RetryAssertion(func() error {
+				var gateway gatewayv1.Gateway
+				if err := s.GetKubeClient().Get(context.Background(), k8stypes.NamespacedName{
+					Name:      gatewayName,
+					Namespace: s.Namespace(),
+				}, &gateway); err != nil {
+					return err
+				}
+				addrs := gateway.Status.Addresses
+				if len(addrs) != len(expected) {
+					return fmt.Errorf("expected %d status addresses, got %d: %+v", len(expected), len(addrs), addrs)
+				}
+				for i, want := range expected {
+					if addrs[i].Value != want.Value {
+						return fmt.Errorf("address %d: expected value %s, got %s", i, want.Value, addrs[i].Value)
+					}
+					if addrs[i].Type == nil {
+						return fmt.Errorf("address %d: expected type to be set, got nil", i)
+					}
+					if *addrs[i].Type != *want.Type {
+						return fmt.Errorf("address %d: expected type %s, got %s", i, *want.Type, *addrs[i].Type)
+					}
+				}
+				return nil
+			}).ShouldNot(HaveOccurred(), "check Gateway status addresses")
+		}
+
+		It("falls back to publishService when statusAddress is empty", func() {
+			By("create LoadBalancer publish Service with an IP and a hostname")
+			createPublishService(
+				corev1.LoadBalancerIngress{IP: "10.99.88.77"},
+				corev1.LoadBalancerIngress{Hostname: "lb.example.com"},
+			)
+
+			By("create GatewayProxy with publishService and no statusAddress")
+			Expect(s.CreateResourceFromString(fmt.Sprintf(gatewayProxyWithPublishServiceYaml,
+				s.Namespace(), s.Namespace(), publishServiceName, s.Deployer.GetAdminEndpoint(), s.AdminKey()),
+			)).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+			createGatewayClassAndGateway(s.Namespace(), s.Namespace())
+
+			By("check Gateway status addresses come from the publish Service")
+			assertGatewayAddresses(s.Namespace(),
+				gatewayv1.GatewayStatusAddress{Type: ptr.To(gatewayv1.IPAddressType), Value: "10.99.88.77"},
+				gatewayv1.GatewayStatusAddress{Type: ptr.To(gatewayv1.HostnameAddressType), Value: "lb.example.com"},
+			)
+		})
+
+		It("prefers statusAddress over publishService when both are set", func() {
+			By("create LoadBalancer publish Service")
+			createPublishService(corev1.LoadBalancerIngress{IP: "10.99.88.77"})
+
+			By("create GatewayProxy with both statusAddress and publishService")
+			Expect(s.CreateResourceFromString(fmt.Sprintf(`
+apiVersion: apisix.apache.org/v1alpha1
+kind: GatewayProxy
+metadata:
+  name: apisix-proxy-config
+  namespace: %s
+spec:
+  statusAddress:
+  - 192.168.1.100
+  publishService: %s/%s
+  provider:
+    type: ControlPlane
+    controlPlane:
+      endpoints:
+      - %s
+      auth:
+        type: AdminKey
+        adminKey:
+          value: "%s"
+`, s.Namespace(), s.Namespace(), publishServiceName, s.Deployer.GetAdminEndpoint(), s.AdminKey()),
+			)).NotTo(HaveOccurred(), "creating GatewayProxy")
+
+			createGatewayClassAndGateway(s.Namespace(), s.Namespace())
+
+			By("check only the static statusAddress is published")
+			assertGatewayAddresses(s.Namespace(),
+				gatewayv1.GatewayStatusAddress{Type: ptr.To(gatewayv1.IPAddressType), Value: "192.168.1.100"})
+		})
+	})
+})
+
+// setPublishServiceAddress writes lbIngress into the Service's
+// status.loadBalancer.ingress, standing in for the cloud provider that assigns
+// a LoadBalancer address in a real cluster.
+func setPublishServiceAddress(s *scaffold.Scaffold, name string, lbIngress ...corev1.LoadBalancerIngress) {
+	var svc corev1.Service
+	Expect(s.GetKubeClient().Get(context.Background(), k8stypes.NamespacedName{
+		Name:      name,
+		Namespace: s.Namespace(),
+	}, &svc)).NotTo(HaveOccurred(), "getting publish Service")
+	svc.Status.LoadBalancer.Ingress = lbIngress
+	Expect(s.GetKubeClient().Status().Update(context.Background(), &svc)).
+		NotTo(HaveOccurred(), "updating publish Service status")
+}

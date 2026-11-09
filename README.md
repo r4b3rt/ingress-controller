@@ -17,93 +17,91 @@
 #
 -->
 
-# Apache APISIX for Kubernetes
+# apisix-ingress-controller
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/apache/apisix-ingress-controller)](https://goreportcard.com/report/github.com/apache/apisix-ingress-controller)
+## Description
 
-Use [Apache APISIX](https://github.com/apache/apisix#apache-apisix) for Kubernetes [Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/).
+The APISIX Ingress Controller allows you to run the APISIX Gateway as a
+Kubernetes Ingress to handle inbound traffic for a Kubernetes cluster. It
+dynamically configures and manages the APISIX Gateway using Gateway API
+resources.
 
-All configurations in `apisix-ingress-controller` are defined with Kubernetes CRDs (Custom Resource Definitions). Such as configure [plugins](https://github.com/apache/apisix/blob/master/docs/en/latest/plugins.md), Support service registration discovery mechanism for upstreams, load balancing and more in Apache APISIX.
+## Document
 
-`apisix-ingress-controller` is an Apache APISIX control plane component. Currently it serves for Kubernetes clusters. In the future, we plan to separate the submodule to adapt to more deployment modes, such as virtual machine clusters.
+* [Getting Started](./docs/en/latest/getting-started)
+* [Concepts](./docs/en/latest/concepts)
+* [Configuration](./docs/en/latest/reference)
 
-The technical architecture of `apisix-ingress-controller`:
+## Getting Started
 
-<img src="./docs/assets/images/module-0.png" alt="Architecture" width="743" height="559" />
+### Prerequisites
 
-## Status
+* go version v1.22.0+.
+* docker version 17.03+.
+* Kubernetes cluster version 1.31+.
+* kubectl version within one minor version difference of your cluster.
 
-This project is currently considered experimental.
+### To Deploy on the cluster
 
-## Features
+**Build and push your image to the location specified by `IMG`:**
 
-* Declarative configuration for Apache APISIX with Custom Resource Definitions(CRDs), using k8s yaml struct with minimum learning curve.
-* Hot-reload during yaml apply.
-* Native Kubernetes Ingress (both `v1` and `v1beta1`) support.
-* Auto register k8s endpoint to upstream (Apache APISIX) node.
-* Out of box support for node health check.
-* Support load balancing based on pod (upstream nodes).
-* Plug-in extension supports hot configuration and immediate effect.
-* Ingress controller itself as a pluggable hot-reload component.
-* Multi-cluster configuration distribution.
+```sh
+make build-image
+```
 
-## Internal Architecture
+**NOTE:** This image ought to be published in the personal registry you
+specified. And it is required to have access to pull the image from the
+working environment. Make sure you have the proper permission to the registry
+if the above commands don't work.
 
-<img src="./docs/assets/images/apisix-ingress-controller-arch.png" alt="module" width="600" height="313" />
+**Install the CRDs & Gateway API into the cluster:**
 
-## Prerequisites
+```sh
+make install
+```
 
-Apisix ingress controller requires Kubernetes version 1.14+.
+**Deploy the Manager to the cluster with the image specified by `IMG`:**
 
-## Get started
+```sh
+make deploy #IMG=apache/apisix-ingress-controller:dev
+```
 
-* [How to install](./install.md)
+> **NOTE**: If you encounter RBAC errors, you may need to grant yourself
+> cluster-admin privileges or be logged in as admin.
 
-## Todos
+**Delete the APIs(CRDs) from the cluster:**
 
-* Support UDP definition. [#116](https://github.com/apache/apisix-ingress-controller/issues/116)
-* Support TCP definition. [#115](https://github.com/apache/apisix-ingress-controller/issues/115)
-* Support GRPC definition. [#114](https://github.com/apache/apisix-ingress-controller/issues/114)
-* Add a complete demo. [#9](https://github.com/apache/apisix-ingress-controller/issues/9)
-* More todos will display in [issues](https://github.com/apache/apisix-ingress-controller/issues)
+```sh
+make uninstall
+```
 
-## Documents
+**UnDeploy the controller from the cluster:**
 
-* [Get Started](./docs/en/latest/getting-started.md)
-* [SDK doc](./docs/en/latest/development.md)
-* [Design introduction](./docs/en/latest/design.md)
+```sh
+make undeploy
+```
 
-## FAQ
+## Project Distribution
 
-* [FAQ](./docs/en/latest/FAQ.md)
+Following are the steps to build the installer and distribute this project to
+users.
 
-## User stories
+1. Build the installer for the image built and published in the registry:
 
-- [aispeech: Why we create a new k8s ingress controller?(Chinese)](https://mp.weixin.qq.com/s/bmm2ibk2V7-XYneLo9XAPQ)
-- [Tencent Cloud: Why choose Apache APISIX to implement the k8s ingress controller?(Chinese)](https://www.upyun.com/opentalk/448.html)
+```sh
+make build-installer # IMG=apache/apisix-ingress-controller:dev
+```
 
-## Contributing
+NOTE: The makefile target mentioned above generates an 'install.yaml'
+file in the dist directory. This file contains all the resources built
+with Kustomize, which are necessary to install this project without
+its dependencies.
 
-We welcome all kinds of contributions from the open-source community, individuals and partners.
+1. Using the installer
 
-* [Contributing Guide](./docs/en/latest/contribute.md)
+Users can just run kubectl apply -f with the YAML bundle to install the
+project, i.e.:
 
-## Community
-
-* Mailing List: Mail to dev-subscribe@apisix.apache.org, follow the reply to subscribe the mailing list.
-* QQ Group - 578997126
-* ![Twitter Follow](https://img.shields.io/twitter/follow/ApacheAPISIX?style=social) - follow and interact with us using hashtag `#ApacheAPISIX`
-* [Bilibili video](https://space.bilibili.com/551921247)
-
-## Milestone
-
-* [Milestone](https://github.com/apache/apisix-ingress-controller/milestones)
-
-## Terminology
-
-* Ingress APISIX: the whole service that contains the proxy ([Apache APISIX](https://apisix.apache.org)) and ingress controller (apisix ingress controller).
-* apisix-ingress-controller: the ingress controller component.
-
-## License
-
-[Apache License 2.0](https://github.com/apache/apisix-ingress-controller/blob/master/LICENSE)
+```sh
+kubectl apply -f dist/install.yaml
+```

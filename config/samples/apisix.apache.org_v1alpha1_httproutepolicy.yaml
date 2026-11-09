@@ -1,0 +1,15 @@
+apiVersion: apisix.apache.org/v1alpha1
+kind: HTTPRoutePolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: apisix-ingress-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: httproutepolicy-sample
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: httpbin
+  priority: 100
+  vars:
+    - ["http_x_route_name", "==", "httpbin"]

@@ -1,0 +1,190 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package v1
+
+import (
+	"context"
+	"fmt"
+
+	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	"github.com/apache/apisix-ingress-controller/internal/adc/translator/annotations"
+	"github.com/apache/apisix-ingress-controller/internal/controller"
+	"github.com/apache/apisix-ingress-controller/internal/webhook/v1/reference"
+	sslvalidator "github.com/apache/apisix-ingress-controller/internal/webhook/v1/ssl"
+)
+
+var ingresslog = logf.Log.WithName("ingress-resource")
+
+// SetupIngressWebhookWithManager registers the webhook for Ingress in the manager.
+func SetupIngressWebhookWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewWebhookManagedBy(mgr, &networkingv1.Ingress{}).
+		WithCustomValidator(NewIngressCustomValidator(mgr.GetClient())).
+		Complete()
+}
+
+// NOTE: The 'path' attribute must follow a specific pattern and should not be modified directly here.
+// Modifying the path for an invalid path can cause API server errors; failing to locate the webhook.
+// +kubebuilder:webhook:path=/validate-networking-k8s-io-v1-ingress,mutating=false,failurePolicy=fail,sideEffects=None,groups=networking.k8s.io,resources=ingresses,verbs=create;update,versions=v1,name=vingress-v1.kb.io,admissionReviewVersions=v1,failurePolicy=Ignore
+
+// IngressCustomValidator struct is responsible for validating the Ingress resource
+// when it is created, updated, or deleted.
+//
+// NOTE: The +kubebuilder:object:generate=false marker prevents controller-gen from generating DeepCopy methods,
+// as this struct is used only for temporary operations and does not need to be deeply copied.
+type IngressCustomValidator struct {
+	Client  client.Client
+	checker reference.Checker
+}
+
+var _ admission.Validator[runtime.Object] = &IngressCustomValidator{}
+
+func NewIngressCustomValidator(c client.Client) *IngressCustomValidator {
+	return &IngressCustomValidator{
+		Client:  c,
+		checker: reference.NewChecker(c, ingresslog),
+	}
+}
+
+// ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type Ingress.
+func (v *IngressCustomValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	ingress, ok := obj.(*networkingv1.Ingress)
+	if !ok {
+		return nil, fmt.Errorf("expected a Ingress object but got %T", obj)
+	}
+	ingresslog.Info("Validation for Ingress upon creation", "name", ingress.GetName(), "namespace", ingress.GetNamespace())
+	if !controller.MatchesIngressClass(v.Client, ingresslog, ingress) {
+		return nil, nil
+	}
+
+	if err := validateAnnotations(ingress); err != nil {
+		return nil, err
+	}
+
+	detector := sslvalidator.NewConflictDetector(v.Client)
+	conflicts := detector.DetectConflicts(ctx, ingress)
+	if len(conflicts) > 0 {
+		return nil, fmt.Errorf("%s", sslvalidator.FormatConflicts(conflicts))
+	}
+
+	warnings := v.collectReferenceWarnings(ctx, ingress)
+	return warnings, nil
+}
+
+// ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type Ingress.
+func (v *IngressCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
+	ingress, ok := newObj.(*networkingv1.Ingress)
+	if !ok {
+		return nil, fmt.Errorf("expected a Ingress object for the newObj but got %T", newObj)
+	}
+	ingresslog.Info("Validation for Ingress upon update", "name", ingress.GetName(), "namespace", ingress.GetNamespace())
+	if !controller.MatchesIngressClass(v.Client, ingresslog, ingress) {
+		return nil, nil
+	}
+
+	if err := validateAnnotations(ingress); err != nil {
+		return nil, err
+	}
+
+	detector := sslvalidator.NewConflictDetector(v.Client)
+	conflicts := detector.DetectConflicts(ctx, ingress)
+	if len(conflicts) > 0 {
+		return nil, fmt.Errorf("%s", sslvalidator.FormatConflicts(conflicts))
+	}
+
+	warnings := v.collectReferenceWarnings(ctx, ingress)
+	return warnings, nil
+}
+
+// validateAnnotations rejects annotation combinations that would otherwise be
+// silently dropped, leaving the route without a requested security plugin.
+// enable-csrf with no csrf-key is refused here so kubectl apply fails loudly
+// instead of programming a route the operator believes is protected.
+func validateAnnotations(ingress *networkingv1.Ingress) error {
+	e := annotations.NewExtractor(ingress.Annotations)
+	if e.GetBoolAnnotation(annotations.AnnotationsEnableCsrf) &&
+		e.GetStringAnnotation(annotations.AnnotationsCsrfKey) == "" {
+		return fmt.Errorf("annotation %q is enabled but %q is missing or empty",
+			annotations.AnnotationsEnableCsrf, annotations.AnnotationsCsrfKey)
+	}
+	return nil
+}
+
+// ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type Ingress.
+func (v *IngressCustomValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	return nil, nil
+}
+
+func (v *IngressCustomValidator) collectReferenceWarnings(ctx context.Context, ingress *networkingv1.Ingress) admission.Warnings {
+	serviceVisited := make(map[types.NamespacedName]struct{})
+	secretVisited := make(map[types.NamespacedName]struct{})
+	namespace := ingress.GetNamespace()
+
+	var warnings admission.Warnings
+
+	addServiceWarning := func(name string) {
+		if name == "" {
+			return
+		}
+		nn := types.NamespacedName{Namespace: namespace, Name: name}
+		if _, seen := serviceVisited[nn]; seen {
+			return
+		}
+		serviceVisited[nn] = struct{}{}
+		warnings = append(warnings, v.checker.Service(ctx, reference.ServiceRef{
+			Object:         ingress,
+			NamespacedName: nn,
+		})...)
+	}
+
+	addSecretWarning := func(name string) {
+		if name == "" {
+			return
+		}
+		nn := types.NamespacedName{Namespace: namespace, Name: name}
+		if _, seen := secretVisited[nn]; seen {
+			return
+		}
+		secretVisited[nn] = struct{}{}
+		warnings = append(warnings, v.checker.Secret(ctx, reference.SecretRef{
+			Object:         ingress,
+			NamespacedName: nn,
+		})...)
+	}
+
+	for _, rule := range ingress.Spec.Rules {
+		if rule.HTTP == nil {
+			continue
+		}
+		for _, path := range rule.HTTP.Paths {
+			if path.Backend.Service != nil {
+				addServiceWarning(path.Backend.Service.Name)
+			}
+		}
+	}
+
+	for _, tls := range ingress.Spec.TLS {
+		addSecretWarning(tls.SecretName)
+	}
+
+	return warnings
+}

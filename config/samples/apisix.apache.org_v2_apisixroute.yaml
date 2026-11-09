@@ -1,0 +1,19 @@
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  labels:
+    app.kubernetes.io/name: apisix-ingress-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: apisixroute-sample
+spec:
+  ingressClassName: apisix
+  http:
+    - name: rule-sample
+      match:
+        hosts:
+          - httpbin.example.com
+        paths:
+          - /get
+      backends:
+        - serviceName: httpbin
+          servicePort: 80

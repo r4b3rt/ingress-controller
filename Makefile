@@ -1,137 +1,570 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-# Licensed to the Apache Software Foundation (ASF) under one or more
-# contributor license agreements.  See the NOTICE file distributed with
-# this work for additional information regarding copyright ownership.
-# The ASF licenses this file to You under the Apache License, Version 2.0
-# (the "License"); you may not use this file except in compliance with
-# the License.  You may obtain a copy of the License at
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-default: help
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
-VERSION ?= 0.5.0
+# Image URL to use all building/pushing image targets
+
+VERSION ?= 2.2.0
+
 RELEASE_SRC = apache-apisix-ingress-controller-${VERSION}-src
-LOCAL_REGISTRY="localhost:5000"
+
 IMAGE_TAG ?= dev
+IMG ?= apache/apisix-ingress-controller:$(IMAGE_TAG)
+# ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
+ENVTEST_K8S_VERSION = 1.30.0
+KIND_NAME ?= apisix-ingress-cluster
+CLOUD_PROVIDER_KIND_VERSION ?= v0.6.0
+CLOUD_PROVIDER_KIND_PID ?= /tmp/cloud-provider-kind.pid
 
-GINKGO ?= $(shell which ginkgo)
-GITSHA ?= $(shell git rev-parse --short=7 HEAD)
-OSNAME ?= $(shell uname -s | tr A-Z a-z)
-OSARCH ?= $(shell uname -m | tr A-Z a-z)
-PWD ?= $(shell pwd)
-ifeq ($(OSARCH), x86_64)
-	OSARCH = amd64
+ADC_VERSION ?= 0.31.0
+
+DIR := $(shell pwd)
+
+GINKGO_VERSION ?= 2.20.0
+TEST_TIMEOUT ?= 80m
+TEST_DIR ?= ./test/e2e/apisix/
+E2E_NODES ?= 4
+
+# CRD Reference Documentation
+CRD_REF_DOCS_VERSION ?= v0.1.0
+CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
+CRD_DOCS_CONFIG ?= docs/assets/crd/config.yaml
+CRD_DOCS_OUTPUT ?= docs/en/latest/reference/api-reference.md
+CRD_DOCS_TEMPLATE ?= docs/assets/template
+
+# go 
+VERSYM="github.com/apache/apisix-ingress-controller/internal/version._buildVersion"
+GITSHASYM="github.com/apache/apisix-ingress-controller/internal/version._buildGitRevision"
+BUILDOSSYM="github.com/apache/apisix-ingress-controller/internal/version._buildOS"
+MINK8SVERSYM="github.com/apache/apisix-ingress-controller/internal/manager._minK8sVersion"
+MIN_K8S_VERSION ?= 1.31.0
+GO_LDFLAGS ?= "-X=$(VERSYM)=$(VERSION) -X=$(GITSHASYM)=$(GITSHA) -X=$(BUILDOSSYM)=$(OSNAME)/$(OSARCH) -X=$(MINK8SVERSYM)=$(MIN_K8S_VERSION)"
+
+# gateway-api
+GATEWAY_API_VERSION ?= v1.6.0
+## https://github.com/kubernetes-sigs/gateway-api/blob/v1.6.0/pkg/features/httproute.go
+SUPPORTED_EXTENDED_FEATURES = "HTTPRouteDestinationPortMatching,HTTPRouteMethodMatching,HTTPRoutePortRedirect,HTTPRouteRequestMirror,HTTPRouteSchemeRedirect,GatewayAddressEmpty,HTTPRouteResponseHeaderModification,GatewayPort8080,HTTPRouteHostRewrite,HTTPRouteQueryParamMatching,HTTPRoutePathRewrite,HTTPRouteBackendProtocolWebSocket,TLSRouteModeTerminate"
+## https://github.com/kubernetes-sigs/gateway-api/blob/v1.6.0/conformance/utils/suite/profiles.go
+CONFORMANCE_PROFILES ?= GATEWAY-HTTP,GATEWAY-GRPC,GATEWAY-TLS
+# Report metadata, filled into the report's implementation block by the suite.
+# https://github.com/kubernetes-sigs/gateway-api/blob/main/conformance/reports/README.md
+CONFORMANCE_ORGANIZATION ?= apache
+CONFORMANCE_PROJECT ?= apisix-ingress-controller
+CONFORMANCE_URL ?= https://github.com/apache/apisix-ingress-controller
+CONFORMANCE_CONTACT ?= https://github.com/apache/apisix-ingress-controller/issues
+# The channel install-gateway-api installs from.
+CONFORMANCE_CHANNEL ?= experimental
+# A non-default mode must map to a specific setup and be documented in the
+# report's Reproduce section.
+CONFORMANCE_MODE ?= default
+# The data plane a release report is produced against. apisix:dev is a floating
+# tag, so a report meant to be reproducible has to name a released one. 3.19.0
+# is the first release carrying apache/apisix#13912 (stream_proxy
+# tls_passthrough), which the TLSRoute Passthrough tests need.
+CONFORMANCE_DATAPLANE_VERSION ?= 3.19.0-debian
+# What the run deploys and what the report declares, following the checked-out
+# state: a release tag pulls the published images for that release, anything
+# else uses the dev images. Upstream rejects a floating name as the version, so
+# a dev run declares the commit instead.
+CONFORMANCE_IMAGE_TAG ?= $(shell git describe --tags --exact-match 2>/dev/null || echo dev)
+override CONFORMANCE_IMAGE_TAG := $(or $(strip $(CONFORMANCE_IMAGE_TAG)),dev)
+ifeq ($(CONFORMANCE_IMAGE_TAG),dev)
+CONFORMANCE_VERSION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+CONFORMANCE_INGRESS_IMAGE ?= apache/apisix-ingress-controller:dev
+CONFORMANCE_ADC_IMAGE ?= ghcr.io/api7/adc:dev
+CONFORMANCE_DATAPLANE_IMAGE ?= apache/apisix:dev
+else
+CONFORMANCE_VERSION ?= $(CONFORMANCE_IMAGE_TAG)
+CONFORMANCE_INGRESS_IMAGE ?= apache/apisix-ingress-controller:$(CONFORMANCE_IMAGE_TAG)
+CONFORMANCE_ADC_IMAGE ?= ghcr.io/api7/adc:$(ADC_VERSION)
+CONFORMANCE_DATAPLANE_IMAGE ?= apache/apisix:$(CONFORMANCE_DATAPLANE_VERSION)
+endif
+CONFORMANCE_TEST_REPORT_OUTPUT ?= $(DIR)/$(CONFORMANCE_CHANNEL)-$(CONFORMANCE_VERSION)-$(CONFORMANCE_MODE)-report.yaml
+
+TEST_EXCLUDES ?= /e2e /conformance /benchmark
+TEST_PACKAGES = $(shell go list ./... $(foreach p,$(TEST_EXCLUDES),| grep -v $(p)))
+
+# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+ifeq (,$(shell go env GOBIN))
+GOBIN=$(shell go env GOPATH)/bin
+else
+GOBIN=$(shell go env GOBIN)
+endif
+GOOS ?= linux
+GOARCH ?= amd64
+
+ifeq ($(shell uname -s),Darwin)
+	GOOS = darwin
 endif
 
-VERSYM="github.com/apache/apisix-ingress-controller/pkg/version._buildVersion"
-GITSHASYM="github.com/apache/apisix-ingress-controller/pkg/version._buildGitRevision"
-BUILDOSSYM="github.com/apache/apisix-ingress-controller/pkg/version._buildOS"
-GO_LDFLAGS ?= "-X=$(VERSYM)=$(VERSION) -X=$(GITSHASYM)=$(GITSHA) -X=$(BUILDOSSYM)=$(OSNAME)/$(OSARCH)"
-E2E_CONCURRENCY ?= 1
-E2E_SKIP_BUILD ?= 0
+ifeq ($(shell uname -m),arm64)
+	GOARCH = arm64
+endif
+ifeq ($(shell uname -m), aarch64)
+	GOARCH = arm64
+endif
 
-### build:                Build apisix-ingress-controller
-.PHONY: build
-build:
-	go build \
-		-o apisix-ingress-controller \
-		-ldflags $(GO_LDFLAGS) \
-		main.go
+# CONTAINER_TOOL defines the container tool to be used for building images.
+# Be aware that the target commands are only tested with Docker which is
+# scaffolded by default. However, you might want to replace it to use other
+# tools. (i.e. podman)
+CONTAINER_TOOL ?= docker
 
-### build-image:          Build apisix-ingress-controller image
-.PHONY: build-image
-build-image:
-	docker build -t apache/apisix-ingress-controller:$(IMAGE_TAG) --build-arg ENABLE_PROXY=true .
+# Setting SHELL to bash allows bash commands to be executed by recipes.
+# Options are set to exit when a recipe line exits non-zero or a piped command fails.
+SHELL = /usr/bin/env bash -o pipefail
+.SHELLFLAGS = -ec
 
-### lint:                 Do static lint check
-.PHONY: lint
-lint:
-	golangci-lint run
+.PHONY: all
+all: build
 
-### gofmt:                Format all go codes
-.PHONY: gofmt
-gofmt:
-	find . -type f -name "*.go" | xargs gofmt -w -s
+##@ General
 
-### unit-test:            Run unit test cases
-.PHONY: unit-test
-unit-test:
-	go test -cover -coverprofile=coverage.txt ./...
+# The help target prints out all targets with their descriptions organized
+# beneath their categories. The categories are represented by '##@' and the
+# target descriptions by '##'. The awk command is responsible for reading the
+# entire set of makefiles included in this invocation, looking for lines of the
+# file as xyz: ## something, and then pretty-format the target and help. Then,
+# if there's a line with ##@ something, that gets pretty-printed as a category.
+# More info on the usage of ANSI control characters for terminal formatting:
+# https://en.wikipedia.org/wiki/ANSI_escape_code#SGR_parameters
+# More info on the awk command:
+# http://linuxcommand.org/lc3_adv_awk.php
 
-### e2e-test:             Run e2e test cases (kind is required)
+.PHONY: help
+help: ## Display this help.
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+
+##@ Development
+
+.PHONY: manifests
+manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+	$(CONTROLLER_GEN) rbac:roleName=apisix-ingress-manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+
+.PHONY: generate
+generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+
+.PHONY: fmt
+fmt: ## Run go fmt against code.
+	go fmt ./...
+
+.PHONY: vet
+vet: ## Run go vet against code.
+	go vet ./...
+
+.PHONY: test
+test: manifests generate fmt vet envtest ## Run tests.
+	KUBEBUILDER_ASSETS="$$( $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path )" go test $(TEST_PACKAGES) -coverprofile cover.out
+
+.PHONY: kind-e2e-test
+kind-e2e-test: kind-up build-image kind-load-images e2e-test
+
+# Utilize Kind or modify the e2e tests to load the image locally, enabling compatibility with other vendors.
 .PHONY: e2e-test
-e2e-test: ginkgo-check push-images-to-kind
-	kubectl apply -f $(PWD)/samples/deploy/crd/v1beta1/ApisixRoute.yaml
-	kubectl apply -f $(PWD)/samples/deploy/crd/v1beta1/ApisixUpstream.yaml
-	kubectl apply -f $(PWD)/samples/deploy/crd/v1beta1/ApisixTls.yaml
-	cd test/e2e && ginkgo -cover -coverprofile=coverage.txt -r --randomizeSuites --randomizeAllSpecs --trace -p --nodes=$(E2E_CONCURRENCY)
+e2e-test: adc
+	go test $(TEST_DIR) -test.timeout=$(TEST_TIMEOUT) -v -ginkgo.v -ginkgo.focus="$(TEST_FOCUS)" -ginkgo.label-filter="$(TEST_LABEL)"
 
-.PHONY: ginkgo-check
-ginkgo-check:
-ifeq ("$(wildcard $(GINKGO))", "")
-	@echo "ERROR: Need to install ginkgo first, run: go get -u github.com/onsi/ginkgo/ginkgo"
-	exit 1
-endif
+.PHONY: ginkgo-e2e-test
+ginkgo-e2e-test: adc
+	@ginkgo -cover -coverprofile=coverage.txt -r --randomize-all --randomize-suites --trace --focus=$(E2E_FOCUS) --nodes=$(E2E_NODES) --label-filter="$(TEST_LABEL)" $(TEST_DIR)
 
-### push-images-to-kind:  Push images used in e2e test suites to kind.
-.PHONY: push-images-to-kind
-push-images-to-kind: kind-up
-ifeq ($(E2E_SKIP_BUILD), 0)
-	docker pull apache/apisix:dev
-	docker tag apache/apisix:dev $(LOCAL_REGISTRY)/apache/apisix:dev
-	docker push $(LOCAL_REGISTRY)/apache/apisix:dev
+.PHONY: install-ginkgo
+install-ginkgo:
+	@go install github.com/onsi/ginkgo/v2/ginkgo@v$(GINKGO_VERSION)
 
-	docker pull bitnami/etcd:3.4.14-debian-10-r0
-	docker tag bitnami/etcd:3.4.14-debian-10-r0 $(LOCAL_REGISTRY)/bitnami/etcd:3.4.14-debian-10-r0
-	docker push $(LOCAL_REGISTRY)/bitnami/etcd:3.4.14-debian-10-r0
+.PHONY: conformance-report-path
+conformance-report-path: ## Print the path conformance-test writes the report to.
+	@echo $(CONFORMANCE_TEST_REPORT_OUTPUT)
 
-	docker pull kennethreitz/httpbin
-	docker tag kennethreitz/httpbin $(LOCAL_REGISTRY)/kennethreitz/httpbin
-	docker push $(LOCAL_REGISTRY)/kennethreitz/httpbin
+.PHONY: conformance-test
+conformance-test: export INGRESS_IMAGE=$(CONFORMANCE_INGRESS_IMAGE)
+conformance-test: export ADC_IMAGE=$(CONFORMANCE_ADC_IMAGE)
+conformance-test: export DATAPLANE_IMAGE=$(CONFORMANCE_DATAPLANE_IMAGE)
+conformance-test:
+	go test -v ./test/conformance -tags conformance,experimental -timeout 60m \
+		--supported-features=$(SUPPORTED_EXTENDED_FEATURES) \
+		--conformance-profiles=$(CONFORMANCE_PROFILES) \
+		--organization="$(CONFORMANCE_ORGANIZATION)" \
+		--project="$(CONFORMANCE_PROJECT)" \
+		--url="$(CONFORMANCE_URL)" \
+		--version="$(CONFORMANCE_VERSION)" \
+		--contact="$(CONFORMANCE_CONTACT)" \
+		--mode="$(CONFORMANCE_MODE)" \
+		--report-output=$(CONFORMANCE_TEST_REPORT_OUTPUT)
 
-	docker build -t apache/apisix-ingress-controller:$(IMAGE_TAG) --build-arg ENABLE_PROXY=true .
-	docker tag apache/apisix-ingress-controller:$(IMAGE_TAG) $(LOCAL_REGISTRY)/apache/apisix-ingress-controller:$(IMAGE_TAG)
-	docker push $(LOCAL_REGISTRY)/apache/apisix-ingress-controller:$(IMAGE_TAG)
+.PHONY: conformance-images
+conformance-images: ## Print the images the conformance run deploys.
+	@echo $(CONFORMANCE_INGRESS_IMAGE)
+	@echo $(CONFORMANCE_ADC_IMAGE)
+	@echo $(CONFORMANCE_DATAPLANE_IMAGE)
 
-	docker pull jmalloc/echo-server:latest
-	docker tag  jmalloc/echo-server:latest $(LOCAL_REGISTRY)/jmalloc/echo-server:latest
-	docker push $(LOCAL_REGISTRY)/jmalloc/echo-server:latest
-endif
+.PHONY: benchmark-test
+benchmark-test:
+	go test -v ./test/benchmark -test.timeout=$(TEST_TIMEOUT) -v -ginkgo.v
 
-### kind-up:              Launch a Kubernetes cluster with a image registry by Kind.
+.PHONY: lint
+lint: sort-import golangci-lint ## Run golangci-lint linter
+	$(GOLANGCI_LINT) run
+
+.PHONY: lint-fix
+lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
+	$(GOLANGCI_LINT) run --fix
+
 .PHONY: kind-up
 kind-up:
-	./utils/kind-with-registry.sh
-### kind-reset:           Delete the Kubernetes cluster created by "make kind-up"
-.PHONY: kind-reset
-kind-reset:
-	kind delete cluster --name apisix
+	@kind get clusters 2>&1 | grep -v $(KIND_NAME) \
+		&& kind create cluster --name $(KIND_NAME) \
+		|| echo "kind cluster already exists"
+	kubectl wait --for=condition=Ready nodes --all
 
-### license-check:        Do Apache License Header check
-.PHONY: license-check
-license-check:
-ifeq ("$(wildcard .actions/openwhisk-utilities/scancode/scanCode.py)", "")
-	git clone https://github.com/apache/openwhisk-utilities.git .actions/openwhisk-utilities
-	cp .actions/ASF* .actions/openwhisk-utilities/scancode/
+.PHONY: kind-lb
+kind-lb: ## Run cloud-provider-kind so LoadBalancer Services in kind get an address.
+	@if [ -f $(CLOUD_PROVIDER_KIND_PID) ] && kill -0 "$$(cat $(CLOUD_PROVIDER_KIND_PID))" 2>/dev/null; then \
+		echo "cloud-provider-kind already running"; \
+	else \
+		go install sigs.k8s.io/cloud-provider-kind@$(CLOUD_PROVIDER_KIND_VERSION); \
+		echo "starting cloud-provider-kind, logs in /tmp/cloud-provider-kind.log"; \
+		nohup $(GOBIN)/cloud-provider-kind > /tmp/cloud-provider-kind.log 2>&1 & \
+		echo $$! > $(CLOUD_PROVIDER_KIND_PID); \
+	fi
+
+.PHONY: kind-down
+kind-down:
+	@kind get clusters 2>&1 | grep $(KIND_NAME) \
+		&& kind delete cluster --name $(KIND_NAME) \
+		|| echo "kind cluster does not exist"
+
+# kind imports images with `ctr import --all-platforms`. With Docker's containerd
+# image store, `docker save` exports every platform of a pulled multi-platform image
+# although only one was pulled, so the import fails; save only the node platform.
+define kind-load-image
+	@if docker info -f '{{.DriverStatus}}' | grep -q io.containerd.snapshotter; then \
+		archive=$$(mktemp) && trap 'rm -f "$$archive"' EXIT && \
+		docker save --platform "$$(docker version -f '{{.Server.Os}}/{{.Server.Arch}}')" -o "$$archive" $(1) && \
+		kind load image-archive "$$archive" --name $(KIND_NAME); \
+	else \
+		kind load docker-image $(1) --name $(KIND_NAME); \
+	fi
+endef
+
+.PHONY: kind-load-images
+kind-load-images: pull-infra-images kind-load-ingress-image kind-load-adc-image
+	$(call kind-load-image,kennethreitz/httpbin:latest)
+	$(call kind-load-image,jmalloc/echo-server:latest)
+	$(call kind-load-image,openresty/openresty:1.27.1.2-4-bullseye-fat)
+	$(call kind-load-image,alpine/curl:8.17.0)
+
+.PHONY: kind-load-ingress-image
+kind-load-ingress-image:
+	$(call kind-load-image,$(IMG))
+
+.PHONY: kind-load-adc-image
+kind-load-adc-image:
+	@docker pull ghcr.io/api7/adc:$(ADC_VERSION)
+	@docker tag ghcr.io/api7/adc:$(ADC_VERSION) ghcr.io/api7/adc:dev
+	$(call kind-load-image,ghcr.io/api7/adc:dev)
+
+.PHONY: pull-infra-images
+pull-infra-images:
+	@docker pull kennethreitz/httpbin:latest
+	@docker pull jmalloc/echo-server:latest
+	@docker pull openresty/openresty:1.27.1.2-4-bullseye-fat
+	@docker pull alpine/curl:8.17.0
+
+##@ Build
+
+.PHONY: build
+build: manifests generate fmt vet ## Build manager binary.
+	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 go build -o bin/apisix-ingress-controller_$(GOARCH) -ldflags $(GO_LDFLAGS) cmd/main.go
+
+linux-build:
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/apisix-ingress-controller -ldflags $(GO_LDFLAGS) cmd/main.go
+
+.PHONY: build-image
+build-image: docker-build
+
+.PHONY: build-push-image
+build-push-image: docker-build
+	@docker push ${IMG}
+
+.PHONY: build-multi-arch
+build-multi-arch:
+	@CGO_ENABLED=0 GOARCH=amd64 go build -o bin/apisix-ingress-controller_amd64 -ldflags $(GO_LDFLAGS) cmd/main.go
+	@CGO_ENABLED=0 GOARCH=arm64 go build -o bin/apisix-ingress-controller_arm64 -ldflags $(GO_LDFLAGS) cmd/main.go
+
+.PHONY: build-multi-arch-image
+build-multi-arch-image: build-multi-arch
+    # daemon.json: "features":{"containerd-snapshotter": true}
+	@docker buildx build --load --platform linux/amd64,linux/arm64 -t $(IMG) .
+
+.PHONY: build-push-multi-arch-image
+build-push-multi-arch-image: build-multi-arch
+	@docker buildx build --push --platform linux/amd64,linux/arm64 -t $(IMG) .
+
+.PHONY: run
+run: manifests generate fmt vet ## Run a controller from your host.
+	go run ./cmd/main.go
+
+# If you wish to build the manager image targeting other platforms you can use the --platform flag.
+# (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
+# More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+.PHONY: docker-build
+docker-build: set-e2e-goos build ## Build docker image with the manager.
+	$(CONTAINER_TOOL) build -t ${IMG} -f Dockerfile .
+
+.PHONY: docker-push
+docker-push: ## Push docker image with the manager.
+	$(CONTAINER_TOOL) push ${IMG}
+
+# PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
+# architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
+# - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
+# - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+# - be able to push the image to your registry (i.e. if you do not set a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
+# To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
+PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
+.PHONY: docker-buildx
+docker-buildx: ## Build and push docker image for the manager for cross-platform support
+	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
+	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
+	- $(CONTAINER_TOOL) buildx create --name apisix-ingress-builder
+	$(CONTAINER_TOOL) buildx use apisix-ingress-builder
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx rm apisix-ingress-builder
+	rm Dockerfile.cross
+
+.PHONY: build-installer
+build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
+	mkdir -p dist
+	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG} sidecar=ghcr.io/api7/adc:$(ADC_VERSION)
+	$(KUSTOMIZE) build config/default > dist/install.yaml
+
+##@ Deployment
+
+ifndef ignore-not-found
+  ignore-not-found = false
 endif
-	.actions/openwhisk-utilities/scancode/scanCode.py --config .actions/ASF-Release.cfg ./
 
-### help:                 Show Makefile rules
-.PHONY: help
-help:
-	@echo Makefile rules:
-	@echo
-	@grep -E '^### [-A-Za-z0-9_]+:' Makefile | sed 's/###/   /'
+.PHONY: e2e-ldap
+e2e-ldap:
+ifeq ("$(E2E_FOCUS)", "")
+	chmod +x ./test/e2e/testdata/ldap/cmd.sh && ./test/e2e/testdata/ldap/cmd.sh start
+endif
+ifneq ("$(E2E_FOCUS)", "")
+	echo $(E2E_FOCUS) | grep -E 'suite-plugins-authentication|consumer|ldap' || exit 0 \
+	&& chmod +x ./test/e2e/testdata/ldap/cmd.sh \
+	&& ./test/e2e/testdata/ldap/cmd.sh start
+endif
 
-### release-src:          Release source
-.PHONY: release-src
+.PHONY: install-gateway-api
+install-gateway-api: ## Install Gateway API CRDs into the K8s cluster specified in ~/.kube/config.
+	# Server-side apply: the v1.6 CRDs exceed the 262144-byte annotation limit of
+	# client-side apply (last-applied-configuration).
+	kubectl apply --server-side --force-conflicts -f https://github.com/kubernetes-sigs/gateway-api/releases/download/$(GATEWAY_API_VERSION)/experimental-install.yaml
+
+.PHONY: uninstall-gateway-api
+uninstall-gateway-api: ## Uninstall Gateway API CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	kubectl delete -f https://github.com/kubernetes-sigs/gateway-api/releases/download/$(GATEWAY_API_VERSION)/experimental-install.yaml
+
+.PHONY: install
+install: manifests kustomize install-gateway-api install-crds ## Install CRDs and Gateway API into the K8s cluster specified in ~/.kube/config.
+
+.PHONY: install-crds
+install-crds: manifests kustomize ## Install CRDs into the K8s cluster specified
+	$(KUSTOMIZE) build config/crd | $(KUBECTL) apply -f -
+
+.PHONY: uninstall
+uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	$(KUSTOMIZE) build config/crd | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+
+.PHONY: deploy
+deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG} sidecar=ghcr.io/api7/adc:$(ADC_VERSION)
+	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
+
+.PHONY: undeploy
+undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+
+##@ Dependencies
+
+## Location to install dependencies to
+LOCALBIN ?= $(shell pwd)/bin
+$(LOCALBIN):
+	mkdir -p $(LOCALBIN)
+
+## Tool Binaries
+KUBECTL ?= kubectl
+KUSTOMIZE ?= $(LOCALBIN)/kustomize
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
+ENVTEST ?= $(LOCALBIN)/setup-envtest
+GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+ADC_BIN ?= $(LOCALBIN)/adc
+
+## Tool Versions
+KUSTOMIZE_VERSION ?= v5.4.2
+CONTROLLER_TOOLS_VERSION ?= v0.17.2
+ENVTEST_VERSION ?= release-0.18
+GOLANGCI_LINT_VERSION ?= v2.7.1
+
+## export PATH so that the tools are found
+export PATH := $(LOCALBIN):$(PATH)
+
+.PHONY: kustomize
+kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
+$(KUSTOMIZE): $(LOCALBIN)
+	$(call go-install-tool,$(KUSTOMIZE),sigs.k8s.io/kustomize/kustomize/v5,$(KUSTOMIZE_VERSION))
+
+.PHONY: controller-gen
+controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
+$(CONTROLLER_GEN): $(LOCALBIN)
+	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_TOOLS_VERSION))
+
+.PHONY: envtest
+envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
+$(ENVTEST): $(LOCALBIN)
+	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
+
+.PHONY: golangci-lint
+golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
+$(GOLANGCI_LINT): $(LOCALBIN)
+	# Build from source with the local Go toolchain: the prebuilt release binary is
+	# compiled with an older Go and panics type-checking a go 1.26 module.
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+.PHONY: adc
+adc: $(ADC_BIN) ## Download adc locally if necessary.
+$(ADC_BIN):
+ifeq ($(ADC_VERSION),dev)
+	@echo "ADC_VERSION=dev, skip download"
+else
+	curl -sSfL https://github.com/api7/adc/releases/download/v${ADC_VERSION}/adc_${ADC_VERSION}_${GOOS}_${GOARCH}.tar.gz \
+		| tar -xz -C $(LOCALBIN)
+endif
+
+gofmt: ## Apply go fmt
+	@gofmt -w -r 'interface{} -> any' .
+	@gofmt -w -r 'FIt -> It' test
+	@gofmt -w -r 'FContext -> Context' test
+	@gofmt -w -r 'FDescribe -> Describe' test
+	@gofmt -w -r 'FDescribeTable -> DescribeTable' test
+	@go fmt ./...
+.PHONY: gofmt
+
+set-e2e-goos:
+	$(eval GOOS=linux)
+	@echo "e2e GOOS: $(GOOS)"
+.PHONY: set-e2e-goos
+
+# go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
+# $1 - target path with name of binary
+# $2 - package url which can be installed
+# $3 - specific version of package
+define go-install-tool
+@[ -f "$(1)-$(3)" ] || { \
+set -e; \
+package=$(2)@$(3) ;\
+echo "Downloading $${package}" ;\
+rm -f $(1) || true ;\
+GOBIN=$(LOCALBIN) go install $${package} ;\
+mv $(1) $(1)-$(3) ;\
+} ;\
+ln -sf $(1)-$(3) $(1)
+endef
+
+helm-build-crds:
+	@echo "build gateway-api standard crds"
+	$(KUSTOMIZE) build github.com/kubernetes-sigs/gateway-api/config/crd\?ref=${GATEWAY_API_VERSION} > charts/crds/gwapi-crds.yaml
+	@echo "build apisix ic crds"
+	$(KUSTOMIZE) build config/crd > charts/crds/apisixic-crds.yaml
+
+sort-import:
+	@./scripts/goimports-reviser.sh >/dev/null 2>&1
+.PHONY: sort-import
+
+.PHONY: generate-crd-docs
+generate-crd-docs: manifests ## Generate CRD reference documentation in a single file
+	@mkdir -p $(dir $(CRD_DOCS_OUTPUT))
+	@echo "Generating CRD reference documentation"
+	@$(CRD_REF_DOCS) \
+		--source-path=./api \
+		--config=$(CRD_DOCS_CONFIG) \
+		--renderer=markdown \
+		--templates-dir=$(CRD_DOCS_TEMPLATE) \
+		--output-path=$(CRD_DOCS_OUTPUT) \
+		--max-depth=100
+	@echo "CRD reference documentation generated at $(CRD_DOCS_OUTPUT)"
+
+.PHONY: check-crd-doc-links
+check-crd-doc-links: ## Check links to headings in the generated CRD reference
+	@python3 scripts/check-crd-doc-links.py $(CRD_DOCS_OUTPUT)
+
+.PHONY: generate-crd-docs-grouped
+generate-crd-docs-grouped: manifests ## Generate CRD reference documentation grouped by API group
+	@mkdir -p docs/crd/groups
+	@echo "Generating CRD reference documentation (grouped by API)"
+	@$(CRD_REF_DOCS) \
+		--source-path=./api \
+		--config=$(CRD_DOCS_CONFIG) \
+		--renderer=markdown \
+		--templates-dir=$(CRD_DOCS_TEMPLATE) \
+		--output-path=docs/crd/groups \
+		--output-mode=group
+	@echo "CRD reference documentation generated in docs/crd/groups directory"
+
+### verify-license:       Verify license headers.
+.PHONY: verify-license
+verify-license:
+	docker run -it --rm -v $(PWD):/github/workspace apache/skywalking-eyes header check -v info
+
+### update-license:       Update license headers.
+.PHONY: update-license
+update-license:
+	docker run -it --rm -v $(PWD):/github/workspace apache/skywalking-eyes header fix
+
+### verify-mdlint:        Verify markdown files lint rules.
+.PHONY: verify-mdlint
+verify-mdlint:
+	docker run -it --rm -v $(PWD):/work tmknom/markdownlint '**/*.md' --ignore node_modules --ignore CHANGELOG.md
+
+### update-mdlint:        Update markdown files lint rules.
+.PHONY: update-mdlint
+update-mdlint:
+	docker run -it --rm -v $(PWD):/work tmknom/markdownlint '**/*.md' -f --ignore node_modules --ignore vendor --ignore CHANGELOG.md
+
+### verify-yamllint:	  Verify yaml files lint rules for `examples` directory.
+.PHONY: verify-yamllint
+verify-yamllint:
+	docker run -it --rm -v $(PWD):/yaml peterdavehello/yamllint yamllint examples
+
+### update-yamlfmt:       Update yaml files format for `examples` directory.
+.PHONY: update-yamlfmt
+update-yamlfmt:
+	go install github.com/google/yamlfmt/cmd/yamlfmt@latest && yamlfmt examples
+
+### verify-all:           Verify all verify- rules.
+.PHONY: verify-all
+verify-all: verify-license verify-mdlint verify-yamllint
+
+### update-all:           Update all update- rules.
+.PHONY: update-all
+update-all: update-license update-mdlint update-gofmt
+
+### release-src:      Release source
 release-src:
 	tar -zcvf $(RELEASE_SRC).tgz \
 	--exclude .github \
@@ -140,7 +573,8 @@ release-src:
 	--exclude .gitignore \
 	--exclude .DS_Store \
 	--exclude docs \
-	--exclude samples \
+	--exclude examples \
+	--exclude scripts \
 	--exclude test \
 	--exclude release \
 	--exclude $(RELEASE_SRC).tgz \
